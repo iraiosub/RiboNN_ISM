@@ -65,6 +65,13 @@ export PYTHONWARNINGS="\${PYTHONWARNINGS:+\${PYTHONWARNINGS},}ignore:pkg_resourc
 echo "Host: \$(hostname)"
 mkdir -p logs data results/human plots_ism_scn2a
 
+for ref in "${FASTA}" "${GTF}"; do
+    if [[ ! -r "\${ref}" ]]; then
+        echo "[ERROR] Reference file is not readable on \$(hostname): \${ref}" >&2
+        exit 1
+    fi
+done
+
 echo "=== Step 1: Generating variant sequences ==="
 python prepare_scn2a_ism.py \\
     --fasta "${FASTA}" \\
@@ -202,4 +209,8 @@ echo "Job 4 submitted  (null test) : ${JOB4}  [afterok:${JOB2}]"
 echo ""
 echo "Pipeline submitted. Monitor with:"
 echo "  squeue -j ${JOB1},${JOB2},${JOB3},${JOB4}"
-echo "  sacct  -j ${JOB1},${JOB2},${JOB3},${JOB4} --format=JobID,JobName,State,Elapsed"
+echo "  sacct  -j ${JOB1},${JOB2},${JOB3},${JOB4} --format=JobID,JobName,State,ExitCode,Elapsed,Reason"
+echo ""
+echo "If a dependency is never satisfied, inspect the upstream job first:"
+echo "  tail -n 80 ${REPO_ROOT}/logs/ism_scn2a_1_prepare_${JOB1}.err"
+echo "  tail -n 80 ${REPO_ROOT}/logs/ism_scn2a_1_prepare_${JOB1}.out"

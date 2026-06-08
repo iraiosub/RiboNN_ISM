@@ -296,15 +296,18 @@ def main():
     print(f"5'UTR      : {len(utr5_ref)} nt")
     print(f"CDS        : {len(cds)} nt  (includes start + stop codons)")
     print(f"3'UTR      : {len(utr3)} nt")
-    print(f"Upstream bases to mutate/delete: {args.upstream_bases}")
+    actual_upstream = min(args.upstream_bases, len(utr5_ref))
+
+    print(f"Upstream bases requested: {args.upstream_bases}")
+    print(f"Upstream bases to mutate/delete: {actual_upstream}")
     print(f"Max growing deletion: {args.max_deletion} bp")
 
     # Show the sequence window being mutated
-    mutated_seq = utr5_ref[-args.upstream_bases:] if len(utr5_ref) >= args.upstream_bases else utr5_ref
-    print(f"\nLast {args.upstream_bases} bases of 5'UTR (ISM window):")
+    mutated_seq = utr5_ref[-actual_upstream:] if actual_upstream else ""
+    print(f"\nLast {actual_upstream} bases of 5'UTR (ISM window):")
     for i, base in enumerate(mutated_seq):
-        offset = -(args.upstream_bases - i)
-        print(f"  offset {offset:+3d}  utr5_pos {len(utr5_ref) - args.upstream_bases + i}  base={base}")
+        offset = -(actual_upstream - i)
+        print(f"  offset {offset:+3d}  utr5_pos {len(utr5_ref) - actual_upstream + i}  base={base}")
 
     print(f"\nFirst 6 nt of CDS (should start ATG): {cds[:6]}")
     if not cds.startswith("ATG"):
@@ -319,9 +322,9 @@ def main():
         return
 
     # Count variants
-    snv_count  = sum(1 for k in range(1, args.upstream_bases + 1)
+    snv_count  = sum(1 for k in range(1, actual_upstream + 1)
                      if utr5_ref[len(utr5_ref) - k] in BASES) * 3
-    del1_count = args.upstream_bases
+    del1_count = actual_upstream
     delN_count = max(0, min(args.max_deletion, len(utr5_ref)) - 1)
     total      = 1 + snv_count + del1_count + delN_count
 
