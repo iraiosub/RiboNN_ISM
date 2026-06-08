@@ -38,7 +38,9 @@ fi
 
 cd "${REPO_ROOT}"
 
-UPSTREAM="${1:-15}"
+# UPSTREAM=9999 → prepare_scn2a_ism.py auto-caps to the actual UTR length,
+# giving a full saturation scan of every base.  Pass a smaller number to restrict.
+UPSTREAM="${1:-9999}"
 MAX_DEL="${2:-15}"
 
 FASTA="/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/GRCh38.primary_assembly.genome.fa"

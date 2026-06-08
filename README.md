@@ -1,3 +1,82 @@
+## SCN2A 5′UTR ISM analysis
+
+End-to-end workflow for running in silico mutagenesis (ISM) on the SCN2A 5′UTR and
+testing whether the altAUG positions are ΔTE outliers.
+
+### Prerequisites
+
+```bash
+conda activate ribonn
+# reference files (CAMP paths – adjust for your system)
+FASTA=/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/GRCh38.primary_assembly.genome.fa
+GTF=/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz
+```
+
+### Step 1 – Generate ISM variant sequences
+
+```bash
+python prepare_scn2a_ism.py \
+    --fasta "${FASTA}" \
+    --gtf   "${GTF}" \
+    --upstream-bases 9999 \
+    --max-deletion   15 \
+    --truncate-utr3 \
+    --output data/prediction_input.txt
+```
+
+`--upstream-bases 9999` is automatically capped to the actual UTR length, producing a
+full saturation scan of every base in the 5′UTR (3 SNVs + 1 deletion per position).
+Use `--audit` first to inspect the UTR length before committing to the full run.
+
+### Step 2 – Run RiboNN predictions (GPU)
+
+```bash
+# interactive / local
+python run_ribonn_predict.py \
+    --input  data/prediction_input.txt \
+    --output results/human/prediction_output.txt
+
+# on the SLURM cluster (steps 1–3 in one job)
+sbatch submit_ism_scn2a.sh
+```
+
+Output: `results/human/prediction_output.txt` (one row per variant, TE per cell type).
+
+### Step 3 – Plot ISM results
+
+```bash
+python plot_te_changes.py \
+    --input          results/human/prediction_output.txt \
+    --outdir         plots_ism_scn2a \
+    --upstream-bases 15
+```
+
+Saves SNV heatmap, deletion heatmap, waterfall chart, and neuronal cell-type panel
+to `plots_ism_scn2a/`.
+
+### Step 4 – altAUG position-matched null test
+
+Tests whether ΔTE at the altAUG positions (−8/−7/−6 by default) are outliers relative
+to the background distribution of all other scanned positions.
+
+```bash
+# interactive / local
+python analyze_altaug_null.py \
+    --input            results/human/prediction_output.txt \
+    --altaug-positions -8 -7 -6 \
+    --outdir           plots_ism_scn2a
+
+# on the SLURM cluster (run after step 2, or chain with --dependency)
+sbatch submit_altaug_null.sh
+sbatch --dependency=afterok:<ISM_JOB_ID> submit_altaug_null.sh
+```
+
+Outputs:
+- `plots_ism_scn2a/altaug_null_summary.tsv` – per-SNV z-scores and empirical p-values
+- `plots_ism_scn2a/altaug_null_plot.png`    – background distribution with altAUG signal overlaid
+
+---
+
 # RiboNN: A deep learning model to predict translation efficiency from mRNA sequence
 
 For more information, please see our [RiboNN paper](https://www.nature.com/articles/s41587-025-02712-x).

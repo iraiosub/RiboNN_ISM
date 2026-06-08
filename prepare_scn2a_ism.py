@@ -188,6 +188,7 @@ def generate_variants(utr5, cds, utr3, upstream_bases, max_deletion):
     del_N variants: delete the last N bases of utr5 (growing window, N = 2..max_deletion)
     """
     utr5_len = len(utr5)
+    upstream_bases = min(upstream_bases, utr5_len)  # guard against values > UTR length
 
     # Reference
     yield "reference", utr5, cds, utr3
