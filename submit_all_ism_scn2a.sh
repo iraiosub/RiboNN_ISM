@@ -73,13 +73,7 @@ for ref in "${FASTA}" "${GTF}"; do
 done
 
 echo "=== Step 1: Generating variant sequences ==="
-python prepare_scn2a_ism.py \\
-    --fasta "${FASTA}" \\
-    --gtf   "${GTF}" \\
-    --upstream-bases ${UPSTREAM} \\
-    --max-deletion   15 \\
-    --truncate-utr3 \\
-    --output data/prediction_input.txt
+python prepare_scn2a_ism.py --fasta "${FASTA}" --gtf "${GTF}" --upstream-bases "${UPSTREAM}" --max-deletion 15 --truncate-utr3 --output data/prediction_input.txt
 EOF
 )
 echo "Job 1 submitted  (prepare)  : ${JOB1}"
@@ -118,12 +112,7 @@ print('GPU:', torch.cuda.get_device_name(0))
 "
 
 echo "=== Step 2: Running RiboNN predictions ==="
-python run_ribonn_predict.py \\
-    --input      data/prediction_input.txt \\
-    --output     results/human/prediction_output.txt \\
-    --top-k      5 \\
-    --batch-size 1024 \\
-    --num-workers \${SLURM_CPUS_PER_TASK:-4}
+python run_ribonn_predict.py --input data/prediction_input.txt --output results/human/prediction_output.txt --top-k 5 --batch-size 1024 --num-workers "\${SLURM_CPUS_PER_TASK:-4}"
 EOF
 )
 echo "Job 2 submitted  (predict)   : ${JOB2}  [afterok:${JOB1}]"
@@ -164,10 +153,7 @@ print(max_off if max_off else 15)
 echo "Detected upstream bases: \${ACTUAL_UPSTREAM}"
 
 echo "=== Step 3: Generating ISM plots ==="
-python plot_te_changes.py \\
-    --input          results/human/prediction_output.txt \\
-    --outdir         plots_ism_scn2a \\
-    --upstream-bases "\${ACTUAL_UPSTREAM}"
+python plot_te_changes.py --input results/human/prediction_output.txt --outdir plots_ism_scn2a --upstream-bases "\${ACTUAL_UPSTREAM}"
 
 echo "Plots saved to plots_ism_scn2a/"
 EOF
@@ -195,10 +181,7 @@ export PYTHONWARNINGS="\${PYTHONWARNINGS:+\${PYTHONWARNINGS},}ignore:pkg_resourc
 echo "Host: \$(hostname)"
 
 echo "=== Step 4: altAUG position-matched null test ==="
-python analyze_altaug_null.py \\
-    --input            results/human/prediction_output.txt \\
-    --altaug-positions ${ALTAUG_P1} ${ALTAUG_P2} ${ALTAUG_P3} \\
-    --outdir           plots_ism_scn2a
+python analyze_altaug_null.py --input results/human/prediction_output.txt --altaug-positions ${ALTAUG_P1} ${ALTAUG_P2} ${ALTAUG_P3} --outdir plots_ism_scn2a
 
 echo "Summary: plots_ism_scn2a/altaug_null_summary.tsv"
 echo "Plot:    plots_ism_scn2a/altaug_null_plot.png"
