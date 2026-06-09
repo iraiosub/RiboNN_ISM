@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analyze_altaug_null.py – Position-matched substitution null for SCN2A altAUG positions.
+analyze_altaug_null.py – Position-matched substitution null for altAUG positions.
 
 Uses the SNV saturation scan from a RiboNN ISM run to test whether ΔTE at the
 specified altAUG positions (-8, -7, -6 by default) are outliers relative to the
@@ -22,7 +22,8 @@ Usage:
         [--input results/human/prediction_output.txt] \\
         [--altaug-positions -8 -7 -6] \\
         [--te-col mean_predicted_TE] \\
-        [--outdir plots_ism_scn2a]
+        [--outdir plots_ism_scn2a] \\
+        [--gene-name SCN2A] [--species human]
 """
 
 import argparse
@@ -171,7 +172,13 @@ def position_null_test(snv_df, altaug_positions):
 
 # ── plotting ──────────────────────────────────────────────────────────────────
 
-def plot_null_distribution(background, signal, bg_stats, te_col, altaug_positions, outdir):
+def title_label(gene_name, species=None):
+    if species:
+        return f"{species} {gene_name}"
+    return gene_name
+
+
+def plot_null_distribution(background, signal, bg_stats, te_col, altaug_positions, outdir, label):
     bg_vals   = background["delta_te"].values
     positions = sorted(signal["offset"].unique())
     palette   = plt.cm.tab10.colors
@@ -269,7 +276,7 @@ def plot_null_distribution(background, signal, bg_stats, te_col, altaug_position
     )
 
     fig.suptitle(
-        "SCN2A 5′UTR ISM: position-matched substitution null for altAUG positions",
+        f"{label} 5′UTR ISM: position-matched substitution null for altAUG positions",
         fontsize=11, y=1.01,
     )
     fig.tight_layout()
@@ -302,6 +309,14 @@ def parse_args():
     parser.add_argument(
         "--outdir", default="plots_ism_scn2a",
         help="Output directory (default: plots_ism_scn2a)",
+    )
+    parser.add_argument(
+        "--gene-name", default="SCN2A",
+        help="Gene label for plot titles (default: SCN2A)",
+    )
+    parser.add_argument(
+        "--species", choices=("human", "mouse"), default=None,
+        help="Species label for plot titles",
     )
     return parser.parse_args()
 
@@ -403,8 +418,9 @@ def main():
     print(f"\nSummary TSV → {tsv_path}")
 
     print("Generating plot ...")
+    label = title_label(args.gene_name, args.species)
     plot_null_distribution(background, signal, bg_stats, args.te_col,
-                           args.altaug_positions, outdir)
+                           args.altaug_positions, outdir, label)
 
     print(f"\nDone. Outputs in {outdir}/")
 

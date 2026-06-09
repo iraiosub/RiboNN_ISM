@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_te_changes.py – Visualise SCN2A 5'UTR ISM results from RiboNN predictions.
+plot_te_changes.py – Visualise 5'UTR ISM results from RiboNN predictions.
 
 Reads results/human/prediction_output.txt (or --input) and the reference row
 from data/prediction_input.txt (or --variants-input), then produces:
@@ -18,7 +18,8 @@ Usage:
         [--input results/human/prediction_output.txt] \\
         [--variants-input data/prediction_input.txt] \\
         [--outdir plots_ism_scn2a] \\
-        [--upstream-bases 15]
+        [--upstream-bases 15] \\
+        [--gene-name SCN2A] [--species human]
 """
 
 import argparse
@@ -31,14 +32,34 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-# Neuronal / brain cell types present in RiboNN human output
-NEURON_TYPES = [
+# Neuronal / brain cell types present in RiboNN output. The prediction wrapper
+# writes these as predicted_TE_* columns; raw TE_* names are accepted too.
+HUMAN_NEURON_TYPES = [
     "TE_neurons",
     "TE_early_neurons",
     "TE_neuronal_precursor_cells",
     "TE_SH.SY5Y",
     "TE_normal_brain_tissue",
     "TE_human_brain_tumor",
+]
+
+MOUSE_NEURON_TYPES = [
+    "TE_Cerebellum",
+    "TE_DRG_neuronal_culture",
+    "TE_Dorsal_section_of_lumbar_spinal_cord",
+    "TE_ES_cell_derived_neurons",
+    "TE_Fetal_cortex",
+    "TE_Forebrain",
+    "TE_NSC",
+    "TE_Neuro2a",
+    "TE_Neurons_(DIV_8)_derived_from_CGR8_ES_cells",
+    "TE_Primary_cortical_neurons",
+    "TE_Striatal_cells",
+    "TE_brain",
+    "TE_dentate_gyrus",
+    "TE_hippocampal",
+    "TE_mouse_eye",
+    "TE_neural_tube",
 ]
 
 BASES = ("A", "C", "G", "T")
@@ -82,6 +103,39 @@ def delta_te(df, ref_row, col="mean_predicted_TE"):
     return df[col] - ref_val
 
 
+def title_label(gene_name, species=None):
+    if species:
+        return f"{species} {gene_name}"
+    return gene_name
+
+
+def _predicted_name(te_name):
+    return f"predicted_{te_name}" if te_name.startswith("TE_") else te_name
+
+
+def neuron_columns_for_species(species, columns):
+    species = (species or "").lower()
+    if species == "human":
+        expected = HUMAN_NEURON_TYPES
+    elif species == "mouse":
+        expected = MOUSE_NEURON_TYPES
+    else:
+        expected = HUMAN_NEURON_TYPES + MOUSE_NEURON_TYPES
+
+    seen = set()
+    available = []
+    for raw_name in expected:
+        for candidate in (_predicted_name(raw_name), raw_name):
+            if candidate in columns and candidate not in seen:
+                available.append(candidate)
+                seen.add(candidate)
+    return available
+
+
+def clean_te_label(column):
+    return column.replace("predicted_TE_", "").replace("TE_", "")
+
+
 def snv_label_to_coords(label):
     """Parse e.g. '-3_A>C' → (offset=-3, ref='A', alt='C')."""
     m = re.match(r"^([+-]\d+)_([ACGT])>([ACGT])$", label)
@@ -108,7 +162,7 @@ def deln_label_to_len(label):
 
 # ── plots ─────────────────────────────────────────────────────────────────────
 
-def plot_snv_heatmap(df, ref_row, upstream_bases, outdir):
+def plot_snv_heatmap(df, ref_row, upstream_bases, outdir, label):
     offsets_all = list(range(-upstream_bases, 0))
     offsets = sorted(set(offsets_all))
     alts    = list(BASES)
@@ -142,7 +196,7 @@ def plot_snv_heatmap(df, ref_row, upstream_bases, outdir):
     ax.set_yticklabels(alts)
     ax.set_xlabel("Position relative to AUG (ref base in parentheses)")
     ax.set_ylabel("Alternate base")
-    ax.set_title("SNV effect on mean predicted TE (ΔTE vs reference)")
+    ax.set_title(f"{label}: SNV effect on mean predicted TE (ΔTE vs reference)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("ΔTE")
     fig.tight_layout()
@@ -152,7 +206,7 @@ def plot_snv_heatmap(df, ref_row, upstream_bases, outdir):
     print(f"  Saved {path}")
 
 
-def plot_del1_heatmap(df, ref_row, upstream_bases, outdir):
+def plot_del1_heatmap(df, ref_row, upstream_bases, outdir, label):
     offsets = sorted(range(-upstream_bases, 0))
     delta_by_offset = {}
     ref_by_offset = {}
@@ -180,7 +234,7 @@ def plot_del1_heatmap(df, ref_row, upstream_bases, outdir):
     ax.set_xticklabels(labels, fontsize=8, rotation=45, ha="right")
     ax.set_yticks([0])
     ax.set_yticklabels(["del1"])
-    ax.set_title("Single-base deletion ΔTE (per position)")
+    ax.set_title(f"{label}: single-base deletion ΔTE (per position)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("ΔTE")
     fig.tight_layout()
@@ -190,7 +244,7 @@ def plot_del1_heatmap(df, ref_row, upstream_bases, outdir):
     print(f"  Saved {path}")
 
 
-def plot_waterfall(df, ref_row, outdir, top_n=40):
+def plot_waterfall(df, ref_row, outdir, label, top_n=40):
     d = delta_te(df, ref_row).copy()
     df2 = df.copy()
     df2["delta_TE"] = d
@@ -208,7 +262,7 @@ def plot_waterfall(df, ref_row, outdir, top_n=40):
     ax.set_xticks(range(len(df2)))
     ax.set_xticklabels(df2["tx_id"], rotation=90, fontsize=7)
     ax.set_ylabel("ΔTE (vs reference)")
-    ax.set_title("Waterfall: effect of all SCN2A 5'UTR variants on mean predicted TE")
+    ax.set_title(f"Waterfall: effect of all {label} 5'UTR variants on mean predicted TE")
     fig.tight_layout()
     path = outdir / "waterfall.png"
     fig.savefig(path, dpi=150)
@@ -216,7 +270,7 @@ def plot_waterfall(df, ref_row, outdir, top_n=40):
     print(f"  Saved {path}")
 
 
-def plot_growing_deletion_trend(df, ref_row, outdir):
+def plot_growing_deletion_trend(df, ref_row, outdir, label):
     rows = []
     for _, row in df.iterrows():
         n = deln_label_to_len(row["tx_id"])
@@ -233,7 +287,7 @@ def plot_growing_deletion_trend(df, ref_row, outdir):
     ax.axhline(0, color="grey", lw=0.8, ls="--")
     ax.set_xlabel("Bases deleted from 5'UTR end (before AUG)")
     ax.set_ylabel("ΔTE (vs reference)")
-    ax.set_title("Effect of growing 5'UTR deletion on SCN2A predicted TE")
+    ax.set_title(f"Effect of growing 5'UTR deletion on {label} predicted TE")
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     fig.tight_layout()
     path = outdir / "growing_deletion_trend.png"
@@ -242,9 +296,9 @@ def plot_growing_deletion_trend(df, ref_row, outdir):
     print(f"  Saved {path}")
 
 
-def plot_neuron_panel(df, ref_row, outdir, top_n=20):
+def plot_neuron_panel(df, ref_row, outdir, label, species=None, top_n=20):
     # Find which neuron cols are present
-    avail = [c for c in NEURON_TYPES if c in df.columns]
+    avail = neuron_columns_for_species(species, df.columns)
     if not avail:
         print("  No neuronal cell-type columns found; skipping neuron panel.")
         return
@@ -253,14 +307,14 @@ def plot_neuron_panel(df, ref_row, outdir, top_n=20):
     ref_vals = {c: ref_row[c] for c in avail}
 
     delta_mat = pd.DataFrame(
-        {c: df2[c] - ref_vals[c] for c in avail},
+        {c: (df2[c] - ref_vals[c]).to_numpy() for c in avail},
         index=df2["tx_id"].values
     )
 
     # Select top_n variants by |mean ΔTE| across neuron types
     delta_mat["abs_mean"] = delta_mat.abs().mean(axis=1)
     top_idx = delta_mat["abs_mean"].abs().nlargest(top_n).index
-    delta_mat = delta_mat.loc[top_idx, avail]
+    delta_mat = delta_mat.loc[top_idx, avail].rename(columns=clean_te_label)
 
     vmax = np.nanmax(np.abs(delta_mat.values))
     if vmax == 0:
@@ -282,7 +336,7 @@ def plot_neuron_panel(df, ref_row, outdir, top_n=20):
     )
     ax.set_xlabel("Cell type")
     ax.set_ylabel("Variant")
-    ax.set_title(f"Top {len(top_idx)} variants — neuronal cell-type ΔTE")
+    ax.set_title(f"{label}: top {len(top_idx)} variants — neuronal cell-type ΔTE")
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
     plt.setp(ax.get_yticklabels(), fontsize=8)
     fig.tight_layout()
@@ -301,6 +355,8 @@ def parse_args():
                         help="Only used to confirm reference row is present; not strictly required")
     parser.add_argument("--outdir",          default="plots_ism_scn2a")
     parser.add_argument("--upstream-bases",  type=int, default=15)
+    parser.add_argument("--gene-name",       default="SCN2A")
+    parser.add_argument("--species",         choices=("human", "mouse"), default=None)
     parser.add_argument("--top-waterfall",   type=int, default=40,
                         help="Number of top/bottom variants shown in waterfall (default 40)")
     parser.add_argument("--top-neuron",      type=int, default=20,
@@ -321,12 +377,13 @@ def main():
     ref_row = get_ref_te(df)
     print(f"  Reference mean_predicted_TE = {ref_row['mean_predicted_TE']:.4f}")
 
+    label = title_label(args.gene_name, args.species)
     print("Generating plots ...")
-    plot_snv_heatmap(df, ref_row, args.upstream_bases, outdir)
-    plot_del1_heatmap(df, ref_row, args.upstream_bases, outdir)
-    plot_waterfall(df, ref_row, outdir, top_n=args.top_waterfall)
-    plot_growing_deletion_trend(df, ref_row, outdir)
-    plot_neuron_panel(df, ref_row, outdir, top_n=args.top_neuron)
+    plot_snv_heatmap(df, ref_row, args.upstream_bases, outdir, label)
+    plot_del1_heatmap(df, ref_row, args.upstream_bases, outdir, label)
+    plot_waterfall(df, ref_row, outdir, label, top_n=args.top_waterfall)
+    plot_growing_deletion_trend(df, ref_row, outdir, label)
+    plot_neuron_panel(df, ref_row, outdir, label, species=args.species, top_n=args.top_neuron)
 
     print(f"\nAll plots saved to {outdir}/")
 

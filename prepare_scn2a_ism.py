@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-prepare_scn2a_ism.py – Generate RiboNN prediction input for SCN2A 5'UTR ISM.
+prepare_scn2a_ism.py – Generate RiboNN prediction input for 5'UTR ISM.
 
-Extracts the SCN2A 5'UTR / CDS / 3'UTR sequences from a genome FASTA + GTF,
+Extracts a gene's 5'UTR / CDS / 3'UTR sequences from a genome FASTA + GTF,
 then generates every SNV and deletion variant in the N bases immediately
 upstream of the canonical AUG start codon.
 
@@ -20,6 +20,8 @@ Then plot with:
 
 Usage:
     python prepare_scn2a_ism.py \\
+        --species human \\
+        --gene-name SCN2A \\
         --fasta /path/to/GRCh38.primary_assembly.genome.fa \\
         --gtf   /path/to/gencode.v44.primary_assembly.annotation.gtf.gz \\
         [--upstream-bases 15] [--max-deletion 15] [--truncate-utr3]
@@ -28,14 +30,24 @@ Usage:
 import argparse
 import csv
 import gzip
+import os
 from pathlib import Path
 
 import numpy as np
 import pyfaidx
 
 # ── defaults matching the CAMP/NEMO shared reference location ────────────────
-DEFAULT_FASTA = "/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/GRCh38.primary_assembly.genome.fa"
-DEFAULT_GTF   = "/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
+DEFAULT_REF_ROOT = "/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref"
+DEFAULT_REFS = {
+    "human": {
+        "fasta": f"{DEFAULT_REF_ROOT}/human/GRCh38.primary_assembly.genome.fa",
+        "gtf": f"{DEFAULT_REF_ROOT}/human/gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
+    },
+    "mouse": {
+        "fasta": f"{DEFAULT_REF_ROOT}/mouse/GRCm39.primary_assembly.genome.fa",
+        "gtf": f"{DEFAULT_REF_ROOT}/mouse/gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
+    },
+}
 
 BASES      = ("A", "C", "G", "T")
 COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -81,6 +93,7 @@ def _interval_len(intervals):
 def load_gene_transcript(gtf_path, gene_name, transcript_id=None):
     """Return the longest-CDS transcript for gene_name from the GTF."""
     transcripts = {}
+    target_gene = gene_name.upper()
     keep = {"exon", "CDS", "start_codon", "stop_codon"}
     with _open(gtf_path) as fh:
         for line in fh:
@@ -93,7 +106,8 @@ def load_gene_transcript(gtf_path, gene_name, transcript_id=None):
             if feature not in keep:
                 continue
             parsed = _parse_gtf_attrs(attrs)
-            if parsed.get("gene_name") != gene_name:
+            parsed_gene = parsed.get("gene_name", "")
+            if parsed_gene.upper() != target_gene:
                 continue
             tid = parsed.get("transcript_id")
             if not tid:
@@ -255,8 +269,12 @@ def check_and_truncate(utr5, cds, utr3, truncate_utr3):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--fasta", default=DEFAULT_FASTA, help="GRCh38 primary assembly FASTA")
-    parser.add_argument("--gtf",   default=DEFAULT_GTF,   help="GENCODE annotation GTF (may be gzipped)")
+    parser.add_argument("--species", choices=sorted(DEFAULT_REFS), default="human",
+                        help="Reference species for default FASTA/GTF paths (default: human)")
+    parser.add_argument("--fasta", default=None,
+                        help="Genome FASTA. Defaults to RIBONN_<SPECIES>_FASTA, RIBONN_FASTA, or the CAMP ref/<species> path.")
+    parser.add_argument("--gtf", default=None,
+                        help="GENCODE annotation GTF. Defaults to RIBONN_<SPECIES>_GTF, RIBONN_GTF, or the CAMP ref/<species> path.")
     parser.add_argument("--gene-name",     default="SCN2A")
     parser.add_argument("--transcript-id", default=None,
                         help="Specific transcript ID (default: longest CDS)")
@@ -273,12 +291,67 @@ def parse_args():
     return parser.parse_args()
 
 
+def discover_reference_path(species, kind):
+    ref_root = Path(os.environ.get("RIBONN_REF_ROOT", DEFAULT_REF_ROOT))
+    species_dir = ref_root / species
+
+    if species == "human" and kind == "fasta":
+        default_name = "GRCh38.primary_assembly.genome.fa"
+    elif species == "human" and kind == "gtf":
+        default_name = "gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
+    elif species == "mouse" and kind == "fasta":
+        default_name = "GRCm39.primary_assembly.genome.fa"
+    else:
+        default_name = "gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
+
+    default_path = species_dir / default_name
+    if default_path.is_file():
+        return str(default_path)
+
+    patterns = (
+        ("GRC*.primary_assembly.genome.fa", "*.primary_assembly.genome.fa", "*.fa")
+        if kind == "fasta"
+        else (
+            "gencode.v*.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
+            "*longest_cds_transcripts*.gtf.gz",
+            "*.gtf.gz",
+            "*.gtf",
+        )
+    )
+    for pattern in patterns:
+        for candidate in sorted(species_dir.glob(pattern)):
+            if candidate.is_file():
+                return str(candidate)
+
+    return str(default_path)
+
+
+def resolve_reference_paths(args):
+    species_key = args.species.upper()
+    fasta = (
+        args.fasta
+        or os.environ.get(f"RIBONN_{species_key}_FASTA")
+        or os.environ.get("RIBONN_FASTA")
+        or discover_reference_path(args.species, "fasta")
+    )
+    gtf = (
+        args.gtf
+        or os.environ.get(f"RIBONN_{species_key}_GTF")
+        or os.environ.get("RIBONN_GTF")
+        or discover_reference_path(args.species, "gtf")
+    )
+    return fasta, gtf
+
+
 def main():
     args = parse_args()
+    fasta_path, gtf_path = resolve_reference_paths(args)
 
-    print(f"Loading transcript for {args.gene_name} ...")
-    fasta = pyfaidx.Fasta(args.fasta)
-    transcript = load_gene_transcript(args.gtf, args.gene_name, args.transcript_id)
+    print(f"Loading transcript for {args.gene_name} ({args.species}) ...")
+    print(f"FASTA      : {fasta_path}")
+    print(f"GTF        : {gtf_path}")
+    fasta = pyfaidx.Fasta(fasta_path)
+    transcript = load_gene_transcript(gtf_path, args.gene_name, args.transcript_id)
     tx_seq, coords = transcript_sequence(fasta, transcript)
     regions = transcript_regions(transcript, coords)
     fasta.close()
@@ -345,8 +418,8 @@ def main():
 
     print(f"\nWrote {written} rows to {out_path}")
     print("\nNext steps:")
-    print("  python run_ribonn_predict.py")
-    print("  python plot_te_changes.py")
+    print(f"  python run_ribonn_predict.py --species {args.species} --input {out_path}")
+    print(f"  python plot_te_changes.py --gene-name {args.gene_name}")
 
 
 if __name__ == "__main__":
