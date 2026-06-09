@@ -1,0 +1,24 @@
+# RiboScanner master-table analysis
+
+This workflow has been converted to a plain R script to avoid R Markdown
+dependencies on headless SLURM nodes (`pandoc`, `X11`, HTML rendering devices).
+
+Run the analysis through:
+
+```bash
+bash submit_riboscanner_master_analysis.sh test
+bash submit_riboscanner_master_analysis.sh full
+```
+
+The executable analysis code is in:
+
+```text
+riboscanner_master_analysis.R
+```
+
+Outputs are written to the RiboScanner project directory:
+
+```text
+riboscanner_analysis*/figures/
+riboscanner_analysis*/*.tsv
+```
