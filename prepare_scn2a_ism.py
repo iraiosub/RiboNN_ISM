@@ -343,15 +343,25 @@ def resolve_reference_paths(args):
     return fasta, gtf
 
 
+def normalize_gene_symbol(gene_name, species):
+    if species == "human":
+        return gene_name.upper()
+    if species == "mouse":
+        lower = gene_name.lower()
+        return lower[:1].upper() + lower[1:]
+    return gene_name
+
+
 def main():
     args = parse_args()
     fasta_path, gtf_path = resolve_reference_paths(args)
+    gene_name = normalize_gene_symbol(args.gene_name, args.species)
 
-    print(f"Loading transcript for {args.gene_name} ({args.species}) ...")
+    print(f"Loading transcript for {gene_name} ({args.species}) ...")
     print(f"FASTA      : {fasta_path}")
     print(f"GTF        : {gtf_path}")
     fasta = pyfaidx.Fasta(fasta_path)
-    transcript = load_gene_transcript(gtf_path, args.gene_name, args.transcript_id)
+    transcript = load_gene_transcript(gtf_path, gene_name, args.transcript_id)
     tx_seq, coords = transcript_sequence(fasta, transcript)
     regions = transcript_regions(transcript, coords)
     fasta.close()
@@ -419,7 +429,7 @@ def main():
     print(f"\nWrote {written} rows to {out_path}")
     print("\nNext steps:")
     print(f"  python run_ribonn_predict.py --species {args.species} --input {out_path}")
-    print(f"  python plot_te_changes.py --gene-name {args.gene_name}")
+    print(f"  python plot_te_changes.py --gene-name {gene_name}")
 
 
 if __name__ == "__main__":

@@ -148,10 +148,36 @@ if [[ ${#ALTAUG_POSITIONS[@]} -eq 0 ]]; then
     exit 2
 fi
 
+normalize_gene_symbol() {
+    local gene="$1"
+    local upper
+    local lower
+
+    upper="$(printf '%s' "${gene}" | tr '[:lower:]' '[:upper:]')"
+    if [[ "${SPECIES}" == "human" ]]; then
+        printf '%s\n' "${upper}"
+        return
+    fi
+
+    lower="$(printf '%s' "${gene}" | tr '[:upper:]' '[:lower:]')"
+    printf '%s%s\n' "$(printf '%s' "${lower:0:1}" | tr '[:lower:]' '[:upper:]')" "${lower:1}"
+}
+
 GENES_CSV="${GENES_CSV// /,}"
 IFS=',' read -r -a GENES <<< "${GENES_CSV}"
 if [[ ${#GENES[@]} -eq 0 ]]; then
     echo "[ERROR] At least one gene must be supplied via --genes." >&2
+    exit 2
+fi
+NORMALIZED_GENES=()
+for gene in "${GENES[@]}"; do
+    if [[ -n "${gene}" ]]; then
+        NORMALIZED_GENES+=("$(normalize_gene_symbol "${gene}")")
+    fi
+done
+GENES=("${NORMALIZED_GENES[@]}")
+if [[ ${#GENES[@]} -eq 0 ]]; then
+    echo "[ERROR] At least one non-empty gene must be supplied via --genes." >&2
     exit 2
 fi
 
