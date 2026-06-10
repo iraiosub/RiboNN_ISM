@@ -988,6 +988,179 @@ if (has_gfp) {
   message("No GFP column was found; skipping GFP group plot and score-versus-GFP QC.")
 }
 
+# ===== Additional score distribution plots ====================================
+
+kw_p <- function(score, group) {
+  tryCatch(kruskal.test(score ~ as.factor(group))$p.value, error = function(e) NA_real_)
+}
+fmt_kw <- function(p) if (is.na(p)) "" else paste0("Kruskal-Wallis p=", signif(p, 3))
+sig_label <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else "ns"
+}
+
+# --- violin: score by group × uorf -------------------------------------------
+violin_n <- analysis_df %>%
+  group_by(group_status_label, uorf_status) %>%
+  summarise(n = n(), y_top = max(riboscanner_score, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(n_label = paste0("n=", n))
+
+kw_sub <- fmt_kw(kw_p(analysis_df$riboscanner_score, analysis_df$group_status))
+
+p_violin <- ggplot(analysis_df, aes(x = group_status_label, y = riboscanner_score, fill = uorf_status)) +
+  geom_violin(position = position_dodge(0.8), alpha = 0.5, scale = "width", trim = FALSE) +
+  geom_boxplot(position = position_dodge(0.8), width = 0.09, alpha = 0.85,
+               outlier.shape = NA, color = "black") +
+  geom_text(data = violin_n,
+            aes(x = group_status_label, y = y_top, label = n_label, group = uorf_status),
+            position = position_dodge(0.8), vjust = -0.4, size = 2.5) +
+  scale_y_continuous(expand = c(0.05, 0)) +
+  labs(title = "RiboScanner score by group and uORF status", subtitle = kw_sub,
+       x = "Group", y = "RiboScanner score", fill = "uORF status") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+save_plot(p_violin, file.path(fig_dir, "riboscanner_score_violin.png"), width = 11, height = 6)
+
+# --- ECDF: score by group -----------------------------------------------------
+p_ecdf <- ggplot(analysis_df, aes(x = riboscanner_score, color = group_status)) +
+  stat_ecdf(size = 0.8) +
+  labs(title = "ECDF: RiboScanner score by group", subtitle = kw_sub,
+       x = "RiboScanner score", y = "Cumulative proportion", color = "Group") +
+  theme_bw()
+save_plot(p_ecdf, file.path(fig_dir, "riboscanner_score_ecdf.png"), width = 9, height = 6)
+
+# --- theoreticals by type -----------------------------------------------------
+type_col_name <- Filter(function(x) x %in% names(analysis_df),
+                        c("orf_rel_to_cds", "orf_label", "model_class", "tpm_threshold_group"))
+type_col_name <- if (length(type_col_name) > 0) type_col_name[[1]] else NULL
+
+if (!is.null(type_col_name)) {
+  if ("is_theoretical_control" %in% names(analysis_df)) {
+    is_theo <- as.logical(analysis_df[["is_theoretical_control"]])
+    is_theo[is.na(is_theo)] <- FALSE
+    theo_df <- analysis_df[is_theo, ]
+  } else {
+    theo_df <- analysis_df[grepl("theoretical", analysis_df$group_status, ignore.case = TRUE), ]
+  }
+  theo_df$type_val <- theo_df[[type_col_name]]
+
+  if (nrow(theo_df) >= 5 && length(unique(theo_df$type_val)) >= 2) {
+    theo_n <- theo_df %>%
+      group_by(type_val) %>%
+      summarise(n = n(), y_top = max(riboscanner_score, na.rm = TRUE)) %>%
+      ungroup() %>%
+      mutate(n_label = paste0("n=", n))
+    kw_theo <- fmt_kw(kw_p(theo_df$riboscanner_score, theo_df$type_val))
+
+    p_violin_theo <- ggplot(theo_df, aes(x = type_val, y = riboscanner_score, fill = type_val)) +
+      geom_violin(alpha = 0.55, scale = "width", trim = FALSE) +
+      geom_boxplot(width = 0.12, alpha = 0.8, outlier.shape = NA, color = "black") +
+      geom_text(data = theo_n, aes(x = type_val, y = y_top, label = n_label),
+                vjust = -0.4, size = 2.5, inherit.aes = FALSE) +
+      scale_y_continuous(expand = c(0.05, 0)) +
+      labs(title = "RiboScanner score: theoretical controls by type",
+           subtitle = kw_theo, x = type_col_name, y = "RiboScanner score") +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 40, hjust = 1), legend.position = "none")
+    save_plot(p_violin_theo, file.path(fig_dir, "riboscanner_score_violin_theoretical_type.png"), width = 11, height = 6)
+
+    p_ecdf_theo <- ggplot(theo_df, aes(x = riboscanner_score, color = type_val)) +
+      stat_ecdf(size = 0.8) +
+      labs(title = "ECDF: RiboScanner score — theoreticals by type",
+           subtitle = kw_theo, x = "RiboScanner score", y = "Cumulative proportion",
+           color = type_col_name) +
+      theme_bw()
+    save_plot(p_ecdf_theo, file.path(fig_dir, "riboscanner_score_ecdf_theoretical_type.png"), width = 10, height = 6)
+    message("Theoretical-type plots written.")
+  } else {
+    message("Skipping theoreticals-by-type plots: too few rows or < 2 types.")
+  }
+} else {
+  message("No type column (orf_label / model_class) found; skipping theoreticals-by-type plots.")
+}
+
+# --- score by distance from main CDS bins -------------------------------------
+if ("dist_to_main" %in% names(analysis_df)) {
+  dist_vals <- analysis_df[["dist_to_main"]]
+  keep_dist <- !is.na(dist_vals) & dist_vals >= 0
+  dist_df <- analysis_df[keep_dist, ]
+  dist_df$dist_bin <- cut(
+    dist_vals[keep_dist],
+    breaks = c(0, 30, 60, 120, Inf),
+    labels = c("0-30", "30-60", "60-120", ">120"),
+    include.lowest = TRUE, right = TRUE
+  )
+
+  dist_n <- dist_df %>%
+    group_by(dist_bin) %>%
+    summarise(n = n(), y_top = max(riboscanner_score, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(n_label = paste0("n=", n))
+
+  kw_dist <- fmt_kw(kw_p(dist_df$riboscanner_score, dist_df$dist_bin))
+
+  pw_dist <- tryCatch(
+    pairwise.wilcox.test(dist_df$riboscanner_score, dist_df$dist_bin, p.adjust.method = "BH"),
+    error = function(e) NULL
+  )
+  if (!is.null(pw_dist)) {
+    pw_mat  <- pw_dist$p.value
+    bins    <- levels(dist_df$dist_bin)
+    adj_pairs <- data.frame(
+      from = bins[-length(bins)],
+      to   = bins[-1],
+      stringsAsFactors = FALSE
+    )
+    adj_pairs$p_adj <- mapply(function(b1, b2) {
+      if (b1 %in% rownames(pw_mat) && b2 %in% colnames(pw_mat)) pw_mat[b1, b2]
+      else if (b2 %in% rownames(pw_mat) && b1 %in% colnames(pw_mat)) pw_mat[b2, b1]
+      else NA_real_
+    }, adj_pairs$from, adj_pairs$to)
+    adj_pairs$sig <- sapply(adj_pairs$p_adj, sig_label)
+
+    pw_caption <- paste(
+      mapply(function(f, t, p) sprintf("%s vs %s: p=%s", f, t,
+                                       if (is.na(p)) "NA" else signif(p, 2)),
+             adj_pairs$from, adj_pairs$to, adj_pairs$p_adj),
+      collapse = "  |  "
+    )
+    readr::write_tsv(
+      tibble::rownames_to_column(as.data.frame(pw_mat), "bin"),
+      file.path(analysis_dir, "score_dist_bin_pairwise_pvalues.tsv")
+    )
+  } else {
+    pw_caption <- ""
+  }
+
+  p_violin_dist <- ggplot(dist_df, aes(x = dist_bin, y = riboscanner_score, fill = dist_bin)) +
+    geom_violin(alpha = 0.55, scale = "width", trim = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.8, outlier.shape = NA, color = "black") +
+    geom_text(data = dist_n, aes(x = dist_bin, y = y_top, label = n_label),
+              vjust = -0.4, size = 3, inherit.aes = FALSE) +
+    scale_y_continuous(expand = c(0.05, 0)) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "RiboScanner score by distance from main CDS",
+         subtitle = kw_dist, caption = pw_caption,
+         x = "Distance to main CDS start (nt)", y = "RiboScanner score") +
+    theme_bw() +
+    theme(legend.position = "none")
+  save_plot(p_violin_dist, file.path(fig_dir, "riboscanner_score_violin_dist_cds.png"), width = 9, height = 6)
+
+  p_ecdf_dist <- ggplot(dist_df, aes(x = riboscanner_score, color = dist_bin)) +
+    stat_ecdf(size = 0.8) +
+    scale_color_brewer(palette = "Set2") +
+    labs(title = "ECDF: RiboScanner score by distance from main CDS",
+         subtitle = kw_dist, caption = pw_caption,
+         x = "RiboScanner score", y = "Cumulative proportion",
+         color = "Dist. to CDS (nt)") +
+    theme_bw()
+  save_plot(p_ecdf_dist, file.path(fig_dir, "riboscanner_score_ecdf_dist_cds.png"), width = 9, height = 6)
+  message("Distance-from-CDS plots written.")
+} else {
+  message("No dist_to_main column found; skipping distance-from-CDS plots.")
+}
+
 readr::write_tsv(fasta_lengths, file.path(analysis_dir, "sequence_length_filter.tsv"))
 readr::write_tsv(length_summary, file.path(analysis_dir, "sequence_length_summary.tsv"))
 readr::write_tsv(column_choices, file.path(analysis_dir, "column_choices.tsv"))
