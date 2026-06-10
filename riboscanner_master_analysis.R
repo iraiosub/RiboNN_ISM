@@ -4,6 +4,15 @@ options(stringsAsFactors = FALSE)
 if (!capabilities("X11")) {
   options(bitmapType = "cairo")
 }
+options(error = function() {
+  msg <- geterrmessage()
+  cat("=== ERROR TRACEBACK ===\n", file = stderr())
+  traceback(3, max.lines = 10)
+  cat("======================\n", file = stderr())
+})
+
+analysis_script_version <- "2026-06-10-post-predict-join-fix"
+message("RiboScanner analysis script version: ", analysis_script_version)
 
 defaults <- list(
   mode = "full",
@@ -15,6 +24,7 @@ defaults <- list(
   analysis_dir = "riboscanner_analysis",
   riboscanner_exe = "RiboScanner",
   riboscanner_env = "",
+  cxx_lib_dir = "",
   run_prediction = TRUE,
   min_sequence_length = 81,
   id_col = "",
@@ -39,6 +49,7 @@ usage <- function() {
     "  --riboscanner-dir PATH\n",
     "  --riboscanner-exe PATH_OR_COMMAND\n",
     "  --riboscanner-env PATH_TO_CONDA_ENV\n",
+    "  --cxx-lib-dir PATH_CONTAINING_LIBSTDCXX\n",
     "  --analysis-dir NAME\n",
     "  --fasta PATH_OR_FILENAME\n",
     "  --test-fasta PATH_OR_FILENAME\n",
@@ -188,6 +199,174 @@ configure_riboscanner_env <- function(exe, env_prefix = "") {
   invisible(prefix)
 }
 
+torch_lib_paths <- function(prefix) {
+  if (is_blank(prefix)) return(character())
+  pattern <- file.path(prefix, "lib", "python*", "site-packages", "torch", "lib")
+  Sys.glob(pattern)
+}
+
+libstdcxx_path <- function(lib_dir) {
+  exact <- file.path(lib_dir, "libstdc++.so.6")
+  if (file.exists(exact)) return(exact)
+  matches <- Sys.glob(file.path(lib_dir, "libstdc++.so.6*"))
+  matches <- matches[file.exists(matches)]
+  if (length(matches) == 0) return(exact)
+  sort(matches, decreasing = TRUE)[1]
+}
+
+libstdcxx_versions <- function(lib_dir) {
+  lib <- libstdcxx_path(lib_dir)
+  strings <- Sys.which("strings")
+  if (!file.exists(lib) || !nzchar(strings)) return(character())
+  suppressWarnings(system2(strings, lib, stdout = TRUE, stderr = FALSE))
+}
+
+libstdcxx_has_cxxabi <- function(lib_dir) {
+  any(grepl("^CXXABI_1\\.3\\.11$", libstdcxx_versions(lib_dir)))
+}
+
+cxx_lib_candidates <- function(prefix, override = "") {
+  candidates <- character()
+  if (!is_blank(override)) {
+    candidates <- c(candidates, override)
+  }
+  if (!is_blank(prefix)) {
+    prefix <- normalizePath(prefix, mustWork = FALSE)
+    candidates <- c(candidates, file.path(prefix, "lib"))
+    base_prefix <- normalizePath(file.path(prefix, "..", ".."), mustWork = FALSE)
+    candidates <- c(candidates, file.path(base_prefix, "lib"))
+  }
+  conda_prefix <- Sys.getenv("CONDA_PREFIX")
+  if (nzchar(conda_prefix)) {
+    candidates <- c(candidates, file.path(conda_prefix, "lib"))
+  }
+  unique(normalizePath(candidates, mustWork = FALSE))
+}
+
+choose_cxx_lib_dir <- function(prefix, override = "") {
+  candidates <- cxx_lib_candidates(prefix, override)
+  candidates <- candidates[vapply(candidates, function(candidate) {
+    file.exists(libstdcxx_path(candidate))
+  }, logical(1))]
+
+  if (!is_blank(override) && !file.exists(libstdcxx_path(override))) {
+    stop("--cxx-lib-dir does not contain libstdc++.so.6*: ", override, call. = FALSE)
+  }
+
+  for (candidate in candidates) {
+    if (libstdcxx_has_cxxabi(candidate)) {
+      message("Selected C++ runtime lib dir: ", candidate)
+      return(candidate)
+    }
+  }
+
+  if (length(candidates) > 0) {
+    message("Checked libstdc++ candidates but none had CXXABI_1.3.11:")
+    for (candidate in candidates) {
+      versions <- libstdcxx_versions(candidate)
+      cxxabi <- tail(versions[grepl("^CXXABI_", versions)], 8)
+      message("  ", libstdcxx_path(candidate), " -> ", paste(cxxabi, collapse = ", "))
+    }
+    warning(
+      "No candidate libstdc++.so.6 advertises CXXABI_1.3.11. ",
+      "Force a newer runtime with --cxx-lib-dir, or run: conda install -p ",
+      prefix, " -c conda-forge --override-channels 'libstdcxx-ng>=12' 'libgcc-ng>=12'",
+      call. = FALSE
+    )
+    return(candidates[1])
+  }
+
+  if (!is_blank(prefix)) {
+    warning(
+      "No libstdc++.so.6 was found near the RiboScanner env. ",
+      "Install one with: conda install -p ", prefix,
+      " -c conda-forge --override-channels 'libstdcxx-ng>=12' 'libgcc-ng>=12'",
+      call. = FALSE
+    )
+  }
+  ""
+}
+
+riboscanner_child_env <- function(prefix, cxx_lib_dir = "") {
+  if (is_blank(prefix)) return(character())
+  prefix <- normalizePath(prefix, mustWork = FALSE)
+  cxx_lib <- if (!is_blank(cxx_lib_dir)) libstdcxx_path(cxx_lib_dir) else ""
+  ld_paths <- unique(c(
+    cxx_lib_dir,
+    file.path(prefix, "lib"),
+    torch_lib_paths(prefix)
+  ))
+  ld_paths <- ld_paths[dir.exists(ld_paths)]
+
+  c(
+    paste0("PATH=", paste(c(file.path(prefix, "bin"), Sys.getenv("PATH")), collapse = .Platform$path.sep)),
+    paste0("LD_LIBRARY_PATH=", paste(ld_paths, collapse = .Platform$path.sep)),
+    if (file.exists(cxx_lib)) paste0("LD_PRELOAD=", cxx_lib) else NULL,
+    paste0("CONDA_PREFIX=", prefix)
+  )
+}
+
+check_libstdcxx <- function(lib_dir, prefix) {
+  if (is_blank(lib_dir)) return(invisible(FALSE))
+  lib <- libstdcxx_path(lib_dir)
+  if (!file.exists(lib)) {
+    warning(
+      "No libstdc++.so.6* found at ", lib, ". ",
+      "Install it with: conda install -p ", prefix,
+      " -c conda-forge --override-channels 'libstdcxx-ng>=12' 'libgcc-ng>=12'",
+      call. = FALSE
+    )
+    return(invisible(FALSE))
+  }
+
+  message("Selected libstdc++: ", normalizePath(lib, mustWork = FALSE))
+  message("RiboScanner child LD_PRELOAD: ", normalizePath(lib, mustWork = FALSE))
+  if (!libstdcxx_has_cxxabi(lib_dir)) {
+    warning(
+      "The selected libstdc++.so.6 does not advertise CXXABI_1.3.11. ",
+      "Update it with: conda install -p ", prefix,
+      " -c conda-forge --override-channels 'libstdcxx-ng>=12' 'libgcc-ng>=12'",
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+preflight_torch_import <- function(prefix, env_vars, analysis_dir) {
+  if (is_blank(prefix)) return(invisible(TRUE))
+  python <- file.path(prefix, "bin", "python")
+  if (!file.exists(python)) return(invisible(TRUE))
+
+  stdout_path <- file.path(analysis_dir, "riboscanner_torch_preflight_stdout.log")
+  stderr_path <- file.path(analysis_dir, "riboscanner_torch_preflight_stderr.log")
+  script_path <- file.path(analysis_dir, "riboscanner_torch_preflight.py")
+  writeLines(
+    c(
+      "import torch",
+      "print('torch import OK', torch.__version__)"
+    ),
+    script_path
+  )
+
+  status <- system2(
+    python,
+    args = shQuote(script_path),
+    env = env_vars,
+    stdout = stdout_path,
+    stderr = stderr_path
+  )
+  if (!is.null(status) && !identical(status, 0L)) {
+    stop(
+      "RiboScanner torch preflight failed before prediction. See: ", stderr_path, "\n",
+      "If stderr mentions CXXABI/libstdc++, pass --cxx-lib-dir PATH_TO_A_NEWER_LIB_DIR ",
+      "or update the conda runtime in: ", prefix,
+      call. = FALSE
+    )
+  }
+  message("Torch preflight OK. Log: ", stdout_path)
+  invisible(TRUE)
+}
+
 discover_one <- function(root, patterns, label) {
   candidates <- unique(unlist(lapply(patterns, function(pattern) {
     list.files(root, pattern = pattern, full.names = TRUE, recursive = FALSE)
@@ -230,7 +409,16 @@ dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 message("RiboScanner directory: ", riboscanner_dir)
 message("Analysis directory:    ", analysis_dir)
 message("Mode:                  ", cfg$mode)
-configure_riboscanner_env(cfg$riboscanner_exe, cfg$riboscanner_env)
+riboscanner_env_prefix <- configure_riboscanner_env(cfg$riboscanner_exe, cfg$riboscanner_env)
+riboscanner_cxx_lib_dir <- choose_cxx_lib_dir(riboscanner_env_prefix, cfg$cxx_lib_dir)
+if (!is_blank(riboscanner_cxx_lib_dir)) {
+  prepend_env_path("LD_LIBRARY_PATH", riboscanner_cxx_lib_dir)
+}
+riboscanner_env_vars <- riboscanner_child_env(riboscanner_env_prefix, riboscanner_cxx_lib_dir)
+check_libstdcxx(riboscanner_cxx_lib_dir, riboscanner_env_prefix)
+if (length(riboscanner_env_vars)) {
+  message("RiboScanner child LD_LIBRARY_PATH: ", sub("^LD_LIBRARY_PATH=", "", riboscanner_env_vars[grepl("^LD_LIBRARY_PATH=", riboscanner_env_vars)]))
+}
 
 selected_fasta <- if (cfg$mode == "test") cfg$test_fasta else cfg$fasta_gz
 fasta_path <- resolve_input_path(selected_fasta, riboscanner_dir)
@@ -242,11 +430,23 @@ if (is.null(fasta_path)) {
   )
 }
 master_path <- resolve_input_path(cfg$master_table, riboscanner_dir)
-if (is.null(master_path)) {
+using_default_master_table <- identical(cfg$master_table, defaults$master_table)
+if (is.null(master_path) || (using_default_master_table && !file.exists(master_path))) {
   master_path <- discover_one(
     riboscanner_dir,
-    patterns = c("^master\\.table$", "^master\\.table\\.(tsv|txt|csv)(\\.gz)?$", "master.*table.*"),
+    patterns = c(
+      "^master[._]table$",
+      "^master[._]table\\.(tsv|txt|csv)(\\.gz)?$",
+      "master.*table.*\\.(tsv|txt|csv)(\\.gz)?$"
+    ),
     label = "master table"
+  )
+}
+if (!file.exists(master_path)) {
+  stop(
+    "Master table not found: ", master_path,
+    ". Pass the correct file with --master-table PATH.",
+    call. = FALSE
   )
 }
 message("FASTA:        ", fasta_path)
@@ -347,18 +547,25 @@ candidate_prediction_files <- function(roots) {
   files[order(file.info(files)$mtime, decreasing = TRUE)]
 }
 
-candidate_roots <- unique(c(analysis_dir, riboscanner_dir, dirname(filtered_fasta)))
+prediction_output_path <- if (is_blank(cfg$prediction_output)) {
+  file.path(analysis_dir, "riboscanner_predictions.tsv")
+} else {
+  resolve_input_path(cfg$prediction_output, riboscanner_dir)
+}
+candidate_roots <- unique(c(analysis_dir, riboscanner_dir, dirname(filtered_fasta), dirname(prediction_output_path)))
 before_candidates <- candidate_prediction_files(candidate_roots)
-stdout_path <- file.path(analysis_dir, "riboscanner_predictions_stdout.tsv")
+stdout_path <- file.path(analysis_dir, "riboscanner_predict_stdout.log")
 stderr_path <- file.path(analysis_dir, "riboscanner_predict_stderr.log")
 
 if (isTRUE(cfg$run_prediction)) {
+  preflight_torch_import(riboscanner_env_prefix, riboscanner_env_vars, analysis_dir)
   filtered_fasta_cmd <- path_for_command(filtered_fasta, riboscanner_dir)
-  cmd_args <- c("predict", "--input", filtered_fasta_cmd)
+  prediction_output_cmd <- path_for_command(prediction_output_path, riboscanner_dir)
+  cmd_args <- c("predict", "--input", filtered_fasta_cmd, "--output", prediction_output_cmd)
   message("Running: ", cfg$riboscanner_exe, " ", paste(cmd_args, collapse = " "))
   old_wd <- getwd()
   setwd(riboscanner_dir)
-  status <- system2(cfg$riboscanner_exe, args = cmd_args, stdout = stdout_path, stderr = stderr_path)
+  status <- system2(cfg$riboscanner_exe, args = cmd_args, env = riboscanner_env_vars, stdout = stdout_path, stderr = stderr_path)
   setwd(old_wd)
   if (!is.null(status) && !identical(status, 0L)) {
     stop("RiboScanner predict failed with status ", status, ". See: ", stderr_path, call. = FALSE)
@@ -370,23 +577,88 @@ if (isTRUE(cfg$run_prediction)) {
 after_candidates <- candidate_prediction_files(candidate_roots)
 new_candidates <- setdiff(after_candidates, before_candidates)
 prediction_candidates <- unique(c(
-  resolve_input_path(cfg$prediction_output, riboscanner_dir),
+  prediction_output_path,
   new_candidates,
-  if (file.exists(stdout_path) && file.info(stdout_path)$size > 0) stdout_path else NULL,
   after_candidates
 ))
+prediction_candidates <- prediction_candidates[file.exists(prediction_candidates)]
+if (length(prediction_candidates) > 0) {
+  message("Prediction candidate files checked:")
+  for (candidate in prediction_candidates) message("  ", candidate)
+}
+
+read_delim_errors <- list()
+file_read_description <- function(path) {
+  if (!file.exists(path)) return("exists=FALSE")
+  info <- file.info(path)
+  paste0(
+    "exists=TRUE, readable=", file.access(path, 4) == 0,
+    ", size_bytes=", info$size
+  )
+}
+
+readr_call <- function(fun, path) {
+  fn <- getExportedValue("readr", fun)
+  args <- list(file = path)
+  supported_args <- names(formals(fn))
+  if ("show_col_types" %in% supported_args) args$show_col_types <- FALSE
+  if ("progress" %in% supported_args) args$progress <- FALSE
+  suppressWarnings(do.call(fn, args))
+}
 
 read_delim_flexible <- function(path) {
+  errors <- character()
+  record_error <- function(name, message) {
+    errors <<- c(errors, paste0(name, ": ", message))
+  }
+  record_result <- function(name, out) {
+    if (!is.null(out) && ncol(out) <= 1) {
+      record_error(name, paste0("parsed ", ncol(out), " column(s); expected a table with >1 columns"))
+    }
+  }
+  on.exit({
+    read_delim_errors[[path]] <<- errors
+  }, add = TRUE)
+
+  if (!file.exists(path)) {
+    record_error("file", "does not exist")
+    return(NULL)
+  }
+
   lower <- tolower(path)
   out <- tryCatch({
     if (str_detect(lower, "\\.csv(\\.gz)?$")) {
-      readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
+      readr_call("read_csv", path)
     } else {
-      readr::read_tsv(path, show_col_types = FALSE, progress = FALSE)
+      readr_call("read_tsv", path)
     }
-  }, error = function(e) NULL)
+  }, error = function(e) {
+    record_error(if (str_detect(lower, "\\.csv(\\.gz)?$")) "read_csv" else "read_tsv", conditionMessage(e))
+    NULL
+  })
   if (!is.null(out) && ncol(out) > 1) return(out)
-  tryCatch(readr::read_table(path, show_col_types = FALSE, progress = FALSE), error = function(e) NULL)
+  record_result(if (str_detect(lower, "\\.csv(\\.gz)?$")) "read_csv" else "read_tsv", out)
+
+  out <- tryCatch(readr_call("read_csv", path), error = function(e) {
+    record_error("read_csv", conditionMessage(e))
+    NULL
+  })
+  if (!is.null(out) && ncol(out) > 1) return(out)
+  record_result("read_csv", out)
+
+  out <- tryCatch(readr_call("read_table", path), error = function(e) {
+    record_error("read_table", conditionMessage(e))
+    NULL
+  })
+  if (!is.null(out) && ncol(out) > 1) return(out)
+  record_result("read_table", out)
+  NULL
+}
+
+read_error_details <- function(path) {
+  errors <- read_delim_errors[[path]]
+  if (length(errors) == 0) return("")
+  paste0(" Read attempts: ", paste(errors, collapse = " | "))
 }
 
 pick_col <- function(df, override, patterns, required = TRUE, label = "column") {
@@ -411,10 +683,17 @@ pick_col <- function(df, override, patterns, required = TRUE, label = "column") 
 
 score_patterns <- c("^score$", "riboscanner.*score", "prediction.*score", "predicted.*score", "probability", "^prob$", "^p_", "prediction", "pred")
 uncertainty_patterns <- c("uncertainty", "std", "sd", "stderr", "se$", "variance", "var$", "entropy", "confidence", "ci")
-id_patterns <- c("^id$", "sequence_id", "seq_id", "fasta_id", "header", "name", "construct", "oligo", "transcript", "tx_id")
+id_patterns <- c("^id$", "orf_id", "sequence_id", "seq_id", "fasta_id", "header", "^name$", "construct", "oligo", "transcript", "tx_id")
 
 master <- read_delim_flexible(master_path)
-if (is.null(master)) stop("Could not read master table: ", master_path, call. = FALSE)
+if (is.null(master)) {
+  stop(
+    "Could not read master table: ", master_path,
+    " (", file_read_description(master_path), ").",
+    read_error_details(master_path),
+    call. = FALSE
+  )
+}
 
 read_prediction_candidate <- function(path) {
   df <- read_delim_flexible(path)
@@ -424,9 +703,12 @@ read_prediction_candidate <- function(path) {
   list(path = path, data = df, score_col = score_col)
 }
 
-prediction_reads <- lapply(prediction_candidates, read_prediction_candidate)
-prediction_reads <- prediction_reads[!vapply(prediction_reads, is.null, logical(1))]
-if (length(prediction_reads) == 0) {
+prediction_choice <- NULL
+for (candidate in prediction_candidates) {
+  prediction_choice <- read_prediction_candidate(candidate)
+  if (!is.null(prediction_choice)) break
+}
+if (is.null(prediction_choice)) {
   stop(
     "Could not find a readable prediction table with a score column. ",
     "Set --prediction-output to the RiboScanner output path. stdout: ",
@@ -437,11 +719,13 @@ if (length(prediction_reads) == 0) {
   )
 }
 
-prediction_choice <- prediction_reads[[1]]
 predictions <- prediction_choice$data
 prediction_path <- prediction_choice$path
 message("Prediction table selected: ", prediction_path)
 
+message("STEP: picking ID/score columns")
+message("  master cols (first 10): ", paste(head(names(master), 10), collapse = ", "))
+message("  prediction cols: ", paste(names(predictions), collapse = ", "))
 master_id_col <- pick_col(master, cfg$id_col, id_patterns, required = FALSE, label = "master ID column")
 prediction_id_col <- pick_col(predictions, cfg$prediction_id_col, id_patterns, required = FALSE, label = "prediction ID column")
 if (is.null(master_id_col)) {
@@ -452,6 +736,7 @@ if (is.null(prediction_id_col)) {
   prediction_id_col <- names(predictions)[1]
   message("Falling back to first prediction column as ID: ", prediction_id_col)
 }
+message("  master_id_col=", master_id_col, "  prediction_id_col=", prediction_id_col)
 
 class_col <- pick_col(master, cfg$class_col, c("negative.*class", "^class$", "class", "label", "category", "group"), required = FALSE, label = "class column")
 detected_col <- pick_col(master, cfg$detected_col, c("detected", "is_detected", "called", "call", "positive"), required = FALSE, label = "detected column")
@@ -459,10 +744,20 @@ uorf_col <- pick_col(master, cfg$uorf_col, c("uoorf", "uo_orf", "uorf", "orf_typ
 gfp_col <- pick_col(master, cfg$gfp_col, c("gfp", "green", "fluorescence", "signal", "reporter"), required = FALSE, label = "GFP column")
 score_col <- prediction_choice$score_col
 uncertainty_col <- pick_col(predictions, cfg$uncertainty_col, uncertainty_patterns, required = FALSE, label = "uncertainty column")
+message("  score_col=", score_col, "  uncertainty_col=", if (is.null(uncertainty_col)) "NULL" else uncertainty_col)
+
+column_or_na <- function(x) {
+  if (is.null(x) || length(x) == 0) return(NA_character_)
+  as.character(x[[1]])
+}
 
 column_choices <- tibble(
   role = c("master_id", "prediction_id", "class", "detected", "uORF_or_uoORF", "GFP_signal", "RiboScanner_score", "RiboScanner_uncertainty"),
-  column = c(master_id_col, prediction_id_col, class_col, detected_col, uorf_col, gfp_col, score_col, uncertainty_col)
+  column = vapply(
+    list(master_id_col, prediction_id_col, class_col, detected_col, uorf_col, gfp_col, score_col, uncertainty_col),
+    column_or_na,
+    character(1)
+  )
 )
 print(column_choices)
 
@@ -518,44 +813,64 @@ derive_uorf_status <- function(df, uorf_col) {
   )
 }
 
+message("STEP: mutating master2")
+master_join_ids  <- normalize_join_id(master[[master_id_col]])
+master_gfp_vals  <- if (!is.null(gfp_col)) readr::parse_number(as.character(master[[gfp_col]])) else NA_real_
 master2 <- master %>%
   mutate(
-    join_id = normalize_join_id(master[[master_id_col]]),
+    join_id      = master_join_ids,
     group_status = derive_group_status(., class_col, detected_col),
-    uorf_status = derive_uorf_status(., uorf_col),
-    gfp_signal = if (!is.null(gfp_col)) readr::parse_number(as.character(master[[gfp_col]])) else NA_real_
+    uorf_status  = derive_uorf_status(., uorf_col),
+    gfp_signal   = master_gfp_vals
   )
 
+message("STEP: mutating predictions2")
+pred_join_ids   <- normalize_join_id(predictions[[prediction_id_col]])
+pred_scores     <- readr::parse_number(as.character(predictions[[score_col]]))
+pred_uncertainty <- if (!is.null(uncertainty_col)) {
+  readr::parse_number(as.character(predictions[[uncertainty_col]]))
+} else {
+  NA_real_
+}
 predictions2 <- predictions %>%
   mutate(
-    join_id = normalize_join_id(predictions[[prediction_id_col]]),
-    riboscanner_score = readr::parse_number(as.character(predictions[[score_col]])),
-    riboscanner_uncertainty = if (!is.null(uncertainty_col)) {
-      readr::parse_number(as.character(predictions[[uncertainty_col]]))
-    } else {
-      NA_real_
-    }
+    join_id                  = pred_join_ids,
+    riboscanner_score        = pred_scores,
+    riboscanner_uncertainty  = pred_uncertainty
   )
 
+message("STEP: joining master_kept")
 lengths2 <- fasta_lengths %>% mutate(join_id = normalize_join_id(fasta_id))
-analysis_df <- master2 %>%
+master_kept <- master2 %>%
   left_join(lengths2, by = "join_id") %>%
-  filter(is.na(kept_for_prediction) | kept_for_prediction) %>%
+  filter(is.na(kept_for_prediction) | kept_for_prediction)
+
+message("STEP: inner_join master_kept x predictions2 (", nrow(master_kept), " x ", nrow(predictions2), " rows)")
+analysis_df <- master_kept %>%
   inner_join(
     predictions2 %>% select(join_id, riboscanner_score, riboscanner_uncertainty, everything()),
     by = "join_id",
     suffix = c("_master", "_prediction")
   )
 
-if (nrow(analysis_df) == 0 && nrow(master2) == nrow(predictions2)) {
-  message("ID join produced zero rows; falling back to row-order join because table sizes match.")
-  analysis_df <- bind_cols(master2, predictions2 %>% select(riboscanner_score, riboscanner_uncertainty)) %>%
-    left_join(lengths2, by = "join_id") %>%
-    filter(is.na(kept_for_prediction) | kept_for_prediction)
+if (nrow(analysis_df) == 0 && nrow(master_kept) == nrow(predictions2)) {
+  message("ID join produced zero rows; falling back to row-order join because kept master rows match prediction rows.")
+  analysis_df <- bind_cols(master_kept, predictions2 %>% select(riboscanner_score, riboscanner_uncertainty))
+} else if (nrow(analysis_df) > 0 && nrow(analysis_df) < nrow(master_kept)) {
+  message(
+    "ID join kept ", nrow(analysis_df), " of ", nrow(master_kept),
+    " length-filtered master rows. Check column_choices.tsv if this is unexpected."
+  )
 }
 
 if (nrow(analysis_df) == 0) {
-  stop("No rows joined between master table and predictions.", call. = FALSE)
+  stop(
+    "No rows joined between master table and predictions. ",
+    "Length-filtered master rows: ", nrow(master_kept),
+    "; prediction rows: ", nrow(predictions2),
+    ". If RiboScanner output preserves FASTA order but not FASTA IDs, the row counts must match for fallback joining.",
+    call. = FALSE
+  )
 }
 
 group_counts <- analysis_df %>% count(group_status, uorf_status, name = "n") %>% arrange(group_status, uorf_status)
@@ -573,14 +888,17 @@ analysis_df <- analysis_df %>%
 
 has_uncertainty <- any(!is.na(analysis_df$riboscanner_uncertainty))
 has_gfp <- any(!is.na(analysis_df$gfp_signal))
+message("STEP: plotting (has_uncertainty=", has_uncertainty, ", has_gfp=", has_gfp, ", nrow=", nrow(analysis_df), ")")
 
 p_score <- ggplot(analysis_df, aes(x = group_status_label, y = riboscanner_score, fill = uorf_status)) +
   geom_boxplot(outlier.shape = NA, alpha = 0.55, position = position_dodge(width = 0.8)) +
-  geom_point(aes(color = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
+  geom_point(aes(color = uorf_status, group = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
   labs(title = "RiboScanner score by negative/detected group and uORF status", x = "Group", y = "RiboScanner score", fill = "uORF status", color = "uORF status") +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
+message("STEP: save p_score")
 save_plot(p_score, file.path(fig_dir, "riboscanner_score_by_group_uorf.png"), width = 11, height = 6)
+message("STEP: p_score done")
 
 score_summary <- analysis_df %>%
   group_by(group_status, uorf_status) %>%
@@ -611,7 +929,7 @@ save_plot(p_score_summary, file.path(fig_dir, "riboscanner_score_summary_uncerta
 if (has_uncertainty) {
   p_unc <- ggplot(analysis_df, aes(x = group_status_label, y = riboscanner_uncertainty, fill = uorf_status)) +
     geom_boxplot(outlier.shape = NA, alpha = 0.55, position = position_dodge(width = 0.8)) +
-    geom_point(aes(color = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
+    geom_point(aes(color = uorf_status, group = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
     labs(title = "RiboScanner uncertainty by group and uORF status", x = "Group", y = "RiboScanner uncertainty", fill = "uORF status", color = "uORF status") +
     theme_bw() +
     theme(axis.text.x = element_text(angle = 30, hjust = 1))
@@ -623,7 +941,7 @@ if (has_uncertainty) {
 if (has_gfp) {
   p_gfp <- ggplot(analysis_df, aes(x = group_status_label, y = gfp_signal, fill = uorf_status)) +
     geom_boxplot(outlier.shape = NA, alpha = 0.55, position = position_dodge(width = 0.8)) +
-    geom_point(aes(color = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
+    geom_point(aes(color = uorf_status, group = uorf_status), position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.55, size = 1.4) +
     labs(title = "GFP signal by negative/detected group and uORF status", x = "Group", y = "GFP signal", fill = "uORF status", color = "uORF status") +
     theme_bw() +
     theme(axis.text.x = element_text(angle = 30, hjust = 1))
