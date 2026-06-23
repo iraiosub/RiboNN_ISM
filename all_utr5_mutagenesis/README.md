@@ -38,6 +38,16 @@ bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
   --species human
 ```
 
+Run the launcher from the checkout with `bash`; it submits the prep, GPU-array,
+and merge jobs itself. If a site wrapper or accidental `sbatch` call executes a
+copy from `/tmp/slurmd`, pass the checkout explicitly:
+
+```bash
+bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
+  --repo-root /path/to/RiboNN_ISM \
+  --species human
+```
+
 To use a full transcript FASTA directly, provide the matching GTF so that the
 workflow can locate the 5′UTR/CDS boundaries:
 
@@ -106,4 +116,3 @@ Inspect:
 - `catalog/shard_manifest.tsv` for array load balance
 - `workflow_manifest.json` for total transcript, position, and variant counts
 - `final/run_summary.json` for merged-output validation
-

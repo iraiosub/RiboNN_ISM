@@ -7,8 +7,57 @@
 
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+is_repo_root() {
+    local candidate="$1"
+    [[ -f "${candidate}/run_ribonn_predict.py" ]] &&
+        [[ -f "${candidate}/all_utr5_mutagenesis/prepare_catalog.py" ]] &&
+        [[ -f "${candidate}/all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh" ]]
+}
+
+find_repo_root() {
+    local candidate abs git_root dir
+    local candidates=()
+
+    # If this launcher is accidentally submitted with sbatch, SLURM may copy it
+    # into /tmp/slurmd before execution. In that case BASH_SOURCE points at the
+    # spool copy, so prefer explicit/user submission locations when available.
+    [[ -n "${RIBONN_ISM_REPO_ROOT:-}" ]] && candidates+=("${RIBONN_ISM_REPO_ROOT}")
+    [[ -n "${SLURM_SUBMIT_DIR:-}" ]] && candidates+=("${SLURM_SUBMIT_DIR}")
+    candidates+=("${SCRIPT_DIR}/.." "${PWD}")
+
+    for candidate in "${candidates[@]}"; do
+        [[ -d "${candidate}" ]] || continue
+        abs="$(cd "${candidate}" 2>/dev/null && pwd -P)" || continue
+
+        if is_repo_root "${abs}"; then
+            echo "${abs}"
+            return 0
+        fi
+
+        if command -v git >/dev/null 2>&1; then
+            git_root="$(git -C "${abs}" rev-parse --show-toplevel 2>/dev/null || true)"
+            if [[ -n "${git_root}" ]] && is_repo_root "${git_root}"; then
+                echo "${git_root}"
+                return 0
+            fi
+        fi
+
+        dir="${abs}"
+        while [[ "${dir}" != "/" ]]; do
+            if is_repo_root "${dir}"; then
+                echo "${dir}"
+                return 0
+            fi
+            dir="$(dirname "${dir}")"
+        done
+    done
+
+    return 1
+}
+
+REPO_ROOT="$(find_repo_root || true)"
 
 usage() {
     cat << 'EOF'
@@ -16,6 +65,7 @@ Usage:
   bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh [options]
 
 Input options:
+  --repo-root PATH          RiboNN_ISM checkout root; normally auto-detected
   --species human|mouse
   --transcript-fasta PATH   Full transcript FASTA; requires --gtf
   --genome-fasta PATH       Reconstruct transcripts from genome FASTA + GTF
@@ -41,6 +91,7 @@ EOF
 
 SPECIES="${RIBONN_SPECIES:-human}"
 REF_ROOT="${RIBONN_REF_ROOT:-/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref}"
+REPO_ROOT_OVERRIDE=""
 TRANSCRIPT_FASTA=""
 GENOME_FASTA=""
 GTF=""
@@ -58,6 +109,7 @@ DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --repo-root) REPO_ROOT_OVERRIDE="$2"; shift 2 ;;
         --species) SPECIES="$2"; shift 2 ;;
         --transcript-fasta) TRANSCRIPT_FASTA="$2"; shift 2 ;;
         --genome-fasta|--fasta) GENOME_FASTA="$2"; shift 2 ;;
@@ -77,6 +129,21 @@ while [[ $# -gt 0 ]]; do
         *) echo "[ERROR] Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "${REPO_ROOT_OVERRIDE}" ]]; then
+    if ! REPO_ROOT="$(cd "${REPO_ROOT_OVERRIDE}" 2>/dev/null && pwd -P)"; then
+        echo "[ERROR] --repo-root does not exist or is not readable: ${REPO_ROOT_OVERRIDE}" >&2
+        exit 2
+    fi
+fi
+if [[ -z "${REPO_ROOT}" ]] || ! is_repo_root "${REPO_ROOT}"; then
+    echo "[ERROR] Could not find the RiboNN_ISM repo root." >&2
+    echo "        Run this launcher from the checkout with bash, or pass:" >&2
+    echo "        --repo-root /path/to/RiboNN_ISM" >&2
+    echo "        Detected script dir: ${SCRIPT_DIR}" >&2
+    echo "        SLURM_SUBMIT_DIR : ${SLURM_SUBMIT_DIR:-<unset>}" >&2
+    exit 2
+fi
 
 case "${SPECIES}" in
     human)
