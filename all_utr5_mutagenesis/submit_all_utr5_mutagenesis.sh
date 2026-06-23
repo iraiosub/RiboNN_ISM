@@ -67,6 +67,8 @@ Usage:
 Input options:
   --repo-root PATH          RiboNN_ISM checkout root; normally auto-detected
   --species human|mouse
+  --orf-predictions PATH    ORF prediction CSV.GZ; defaults to ref/<species>/orfs
+  --all-utr5                Mutate every retained 5'UTR base instead of ORF starts
   --transcript-fasta PATH   Full transcript FASTA; requires --gtf
   --genome-fasta PATH       Reconstruct transcripts from genome FASTA + GTF
   --gtf PATH
@@ -84,8 +86,10 @@ Scaling options:
   --keep-intermediates      Keep shard variant inputs and lean variant scores
   --dry-run                 Print resolved settings without submitting
 
-The default source is the same species-specific genome FASTA + longest-CDS GTF
-used by the existing SCN2A RiboNN analyses.
+The default screen mutates only ORF start codons fully inside the 5'UTR:
+orf_start, orf_start+1, and orf_start+2. The default sequence source is the
+same species-specific genome FASTA + longest-CDS GTF used by the existing
+SCN2A RiboNN analyses.
 EOF
 }
 
@@ -95,6 +99,8 @@ REPO_ROOT_OVERRIDE=""
 TRANSCRIPT_FASTA=""
 GENOME_FASTA=""
 GTF=""
+ORF_PREDICTIONS=""
+ALL_UTR5=0
 INPUT_TABLE=""
 OUTDIR=""
 NUM_SHARDS=128
@@ -111,6 +117,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo-root) REPO_ROOT_OVERRIDE="$2"; shift 2 ;;
         --species) SPECIES="$2"; shift 2 ;;
+        --orf-predictions) ORF_PREDICTIONS="$2"; shift 2 ;;
+        --all-utr5) ALL_UTR5=1; shift ;;
         --transcript-fasta) TRANSCRIPT_FASTA="$2"; shift 2 ;;
         --genome-fasta|--fasta) GENOME_FASTA="$2"; shift 2 ;;
         --gtf) GTF="$2"; shift 2 ;;
@@ -149,10 +157,12 @@ case "${SPECIES}" in
     human)
         DEFAULT_GENOME="${REF_ROOT}/human/GRCh38.primary_assembly.genome.fa"
         DEFAULT_GTF="${REF_ROOT}/human/gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
+        DEFAULT_ORF_PREDICTIONS="${REF_ROOT}/human/orfs/gencode.v44.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz"
         ;;
     mouse)
         DEFAULT_GENOME="${REF_ROOT}/mouse/GRCm39.primary_assembly.genome.fa"
         DEFAULT_GTF="${REF_ROOT}/mouse/gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
+        DEFAULT_ORF_PREDICTIONS="${REF_ROOT}/mouse/orfs/gencode.vM33.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz"
         ;;
     *)
         echo "[ERROR] --species must be human or mouse." >&2
@@ -168,10 +178,23 @@ if [[ -n "${TRANSCRIPT_FASTA}" && -n "${GENOME_FASTA}" ]]; then
     echo "[ERROR] Choose --transcript-fasta or --genome-fasta, not both." >&2
     exit 2
 fi
+if [[ "${ALL_UTR5}" -eq 1 && -n "${ORF_PREDICTIONS}" ]]; then
+    echo "[ERROR] --all-utr5 cannot be combined with --orf-predictions." >&2
+    exit 2
+fi
 
 GTF="${GTF:-${DEFAULT_GTF}}"
 GENOME_FASTA="${GENOME_FASTA:-${DEFAULT_GENOME}}"
-OUTDIR="${OUTDIR:-${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}}"
+if [[ "${ALL_UTR5}" -eq 0 ]]; then
+    ORF_PREDICTIONS="${ORF_PREDICTIONS:-${DEFAULT_ORF_PREDICTIONS}}"
+fi
+RUN_LABEL="orf_start_codon"
+DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_orf_starts"
+if [[ "${ALL_UTR5}" -eq 1 ]]; then
+    RUN_LABEL="all_utr5"
+    DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_all_utr5"
+fi
+OUTDIR="${OUTDIR:-${DEFAULT_OUTDIR}}"
 
 if ! [[ "${NUM_SHARDS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "[ERROR] --num-shards must be a positive integer." >&2
@@ -192,12 +215,20 @@ else
     SOURCE_LABEL="genome FASTA: ${GENOME_FASTA}"
     PREP_SOURCE_ARGS=(--genome-fasta "${GENOME_FASTA}" --gtf "${GTF}")
 fi
+SCREEN_LABEL="ORF start codons in 5'UTR: ${ORF_PREDICTIONS}"
+if [[ "${ALL_UTR5}" -eq 0 ]]; then
+    PREP_SOURCE_ARGS+=(--orf-predictions "${ORF_PREDICTIONS}")
+else
+    SCREEN_LABEL="all retained 5'UTR bases"
+fi
 
-echo "=== All-transcript 5'UTR mutagenesis ==="
+echo "=== Targeted 5'UTR mutagenesis ==="
 echo "Repo root       : ${REPO_ROOT}"
 echo "Species         : ${SPECIES}"
 echo "Source          : ${SOURCE_LABEL}"
 echo "GTF             : ${GTF}"
+echo "Screen          : ${SCREEN_LABEL}"
+echo "Run label       : ${RUN_LABEL}"
 echo "Output          : ${OUTDIR}"
 echo "Array shards    : ${NUM_SHARDS}"
 echo "Concurrent GPUs : ${MAX_CONCURRENT}"
@@ -276,7 +307,8 @@ SHARD_WORK="${OUTDIR}/work/shard_\${SHARD_ID}"
 SHARD_INPUT="\${SHARD_WORK}/variants.tsv.gz"
 SHARD_SCORES="\${SHARD_WORK}/variant_mean_te.tsv.gz"
 SHARD_SUMMARY="${OUTDIR}/summaries/shard_\${SHARD_ID}.positions.tsv.gz"
-DONE_FILE="\${SHARD_WORK}/complete"
+SHARD_ORF_SUMMARY="${OUTDIR}/summaries/shard_\${SHARD_ID}.orfs.tsv.gz"
+DONE_FILE="\${SHARD_WORK}/complete.${RUN_LABEL}"
 
 if [[ ! -f "\${SHARD_CATALOG}" ]]; then
     echo "No effective shard \${SHARD_ID}; exiting cleanly."
@@ -306,7 +338,8 @@ python all_utr5_mutagenesis/predict_mean_te.py \
 python all_utr5_mutagenesis/summarize_shard.py \
     --catalog "\${SHARD_CATALOG}" \
     --scores "\${SHARD_SCORES}" \
-    --output "\${SHARD_SUMMARY}"
+    --output "\${SHARD_SUMMARY}" \
+    --orf-output "\${SHARD_ORF_SUMMARY}"
 
 touch "\${DONE_FILE}"
 if [[ "${KEEP_INTERMEDIATES}" -eq 0 ]]; then
@@ -340,3 +373,6 @@ echo "Monitor:"
 echo "  squeue -j ${PREP_JOB},${ARRAY_JOB},${MERGE_JOB}"
 echo "Final table:"
 echo "  ${OUTDIR}/final/all_utr5_position_scores.tsv.gz"
+if [[ "${ALL_UTR5}" -eq 0 ]]; then
+    echo "  ${OUTDIR}/final/orf_start_codon_scores.tsv.gz"
+fi

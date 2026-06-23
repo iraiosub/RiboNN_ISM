@@ -18,6 +18,21 @@ def parse_args():
     return parser.parse_args()
 
 
+def target_positions(row: dict, utr5_size: int) -> list[int]:
+    encoded = str(row.get("target_positions_1based", "") or "").strip()
+    if encoded:
+        positions = [int(value) for value in encoded.split(";") if value]
+    else:
+        positions = list(range(1, utr5_size + 1))
+    for pos1 in positions:
+        if pos1 < 1 or pos1 > utr5_size:
+            raise ValueError(
+                f"{row.get('transcript_id', row.get('tx_index'))}: target "
+                f"position {pos1} is outside 5'UTR length {utr5_size}"
+            )
+    return positions
+
+
 def main():
     args = parse_args()
     output = Path(args.output)
@@ -38,14 +53,16 @@ def main():
             sequence = row["tx_sequence"]
             utr5_size = int(row["utr5_size"])
             cds_size = int(row["cds_size"])
+            positions = target_positions(row, utr5_size)
 
             writer.writerow(
                 [variant_id(tx_index, "wt"), sequence, utr5_size, cds_size]
             )
             variant_count += 1
 
-            for pos0, ref in enumerate(sequence[:utr5_size]):
-                pos1 = pos0 + 1
+            for pos1 in positions:
+                pos0 = pos1 - 1
+                ref = sequence[pos0]
                 for alt in BASES:
                     if alt == ref:
                         continue
@@ -78,4 +95,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

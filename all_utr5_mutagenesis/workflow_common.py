@@ -30,6 +30,10 @@ DEFAULT_REFS = {
         "gtf": DEFAULT_REF_ROOT
         / "human"
         / "gencode.v44.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
+        "orf_predictions": DEFAULT_REF_ROOT
+        / "human"
+        / "orfs"
+        / "gencode.v44.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz",
     },
     "mouse": {
         "genome_fasta": DEFAULT_REF_ROOT
@@ -38,6 +42,10 @@ DEFAULT_REFS = {
         "gtf": DEFAULT_REF_ROOT
         / "mouse"
         / "gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
+        "orf_predictions": DEFAULT_REF_ROOT
+        / "mouse"
+        / "orfs"
+        / "gencode.vM33.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz",
     },
 }
 
@@ -321,4 +329,3 @@ def write_dict_rows(
             writer.writerow({key: row.get(key, "") for key in fieldnames})
             count += 1
     return count
-

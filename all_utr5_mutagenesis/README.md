@@ -1,19 +1,28 @@
-# Transcriptome-wide 5′UTR mutagenesis
+# ORF-start-focused 5′UTR mutagenesis
 
-This is a separate, additive workflow for saturating every retained 5′UTR
-position with:
+This is a separate, additive workflow for saturating selected 5′UTR positions
+with:
 
 - all three possible single-nucleotide substitutions; and
 - a one-nucleotide deletion.
 
-It predicts RiboNN TE changes without producing per-transcript heatmaps. The
-main output is one compressed table row per 5′UTR position:
+By default it no longer mutates every 5′UTR base. It uses the ORF prediction
+table to keep only start codons fully inside the 5′UTR, then mutates exactly
+`orf_start`, `orf_start + 1`, and `orf_start + 2`. The catalog stage checks that
+each retained ORF start codon is `ATG`.
 
-`output/<species>/final/all_utr5_position_scores.tsv.gz`
+It predicts RiboNN TE changes without producing per-transcript heatmaps. The
+main outputs are:
+
+- `output/<species>_orf_starts/final/all_utr5_position_scores.tsv.gz`: one row
+  per targeted 5′UTR base
+- `output/<species>_orf_starts/final/orf_start_codon_scores.tsv.gz`: one row
+  per retained ORF start codon, averaging the three start-codon positions
 
 Important columns are:
 
 - `transcript_id`, `utr5_position_1based`, `offset_from_cds_start`, `ref_base`
+- `orf_start_1based`, `orf_position_in_start_codon`, `target_codon`
 - `wt_mean_predicted_TE`
 - `substitution_te_change_mean`: mean of the three alternative-base scores
   minus the transcript WT score
@@ -23,6 +32,12 @@ Important columns are:
 - `deletion_te_change`: single-base deletion score minus WT
 - `deletion_direction_vs_wt`
 
+The ORF-level table adds:
+
+- `orf_substitution_te_change_mean_3nt`
+- `orf_deletion_te_change_mean_3nt`
+- direction columns for those three-position averages
+
 Here, mean predicted TE is averaged across the RiboNN output cell types and
 test folds, matching the scalar `mean_predicted_TE` idea used by the existing
 SCN2A workflow.
@@ -31,7 +46,8 @@ SCN2A workflow.
 
 The default is the same species-specific genome FASTA plus
 `longest_cds_transcripts.gtf.gz` reference used by the existing SCN2A RiboNN
-analyses:
+analyses, and the species-specific ORF prediction file under
+`/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/<species>/orfs`:
 
 ```bash
 bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
@@ -46,6 +62,14 @@ copy from `/tmp/slurmd`, pass the checkout explicitly:
 bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
   --repo-root /path/to/RiboNN_ISM \
   --species human
+```
+
+To provide a different ORF table:
+
+```bash
+bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
+  --species human \
+  --orf-predictions /path/to/orf_predictions.csv.gz
 ```
 
 To use a full transcript FASTA directly, provide the matching GTF so that the
@@ -66,6 +90,14 @@ bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
   --input-table /path/to/transcripts.tsv
 ```
 
+The old full-5′UTR screen is still available, but it is intentionally opt-in:
+
+```bash
+bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
+  --species human \
+  --all-utr5
+```
+
 The RiboScanner file `master_table.context_m40_p40.fa.gz` used elsewhere in
 this repository contains fixed 81-nt start-codon contexts, not full
 transcripts. It cannot support whole-5′UTR RiboNN mutagenesis because it lacks
@@ -74,7 +106,7 @@ complete 5′UTR, CDS, and 3′UTR sequences.
 ## HPC scaling
 
 The workflow uses a weighted SLURM array. Transcripts remain intact within a
-shard, while shard boundaries are chosen by predicted variant count, so GPU
+shard, while shard boundaries are chosen by targeted variant count, so GPU
 tasks have similar loads and each transcript WT is predicted only once.
 
 ```bash
@@ -87,7 +119,7 @@ bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
 
 Each array task:
 
-1. materializes only its own compressed variant TSV;
+1. materializes only its own compressed targeted-variant TSV;
 2. runs RiboNN;
 3. immediately reduces the model outputs to one scalar per variant;
 4. writes the per-position summary; and
@@ -98,7 +130,7 @@ Use `--keep-intermediates` to retain those shard files. Completed shards have a
 
 Useful tuning:
 
-- increase `--num-shards` if a task uses too much RAM;
+- increase `--num-shards` if a task is still too slow or uses too much RAM;
 - reduce `--batch-size` if GPU memory is limiting;
 - set `--max-concurrent` to the number of GPUs you want to occupy;
 - use `--top-k 5` for parity with the existing analyses.
@@ -107,12 +139,15 @@ Useful tuning:
 
 The catalog stage excludes transcripts that RiboNN cannot encode, including
 non-ACGT sequence, empty/over-limit 5′UTRs, noncanonical CDS starts, invalid
-CDS lengths, or missing terminal stop codons. Long 3′UTRs are truncated by
-default to preserve the full CDS and satisfy the model limit.
+CDS lengths, or missing terminal stop codons. In default ORF mode it further
+excludes transcripts without any ATG ORF start codon fully inside the 5′UTR.
+Long 3′UTRs are truncated by default to preserve the full CDS and satisfy the
+model limit.
 
 Inspect:
 
 - `catalog/catalog_audit.tsv.gz` for inclusion/exclusion reasons
+- `catalog/orf_target_audit.tsv.gz` for ORF-start ATG and 5′UTR checks
 - `catalog/shard_manifest.tsv` for array load balance
 - `workflow_manifest.json` for total transcript, position, and variant counts
 - `final/run_summary.json` for merged-output validation

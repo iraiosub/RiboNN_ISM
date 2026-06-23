@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +42,11 @@ CATALOG_FIELDS = [
     "utr3_size",
     "original_utr3_size",
     "utr3_truncated",
+    "screen_mode",
+    "target_position_count",
+    "target_positions_1based",
+    "orf_target_count",
+    "orf_targets_json",
     "variant_count",
 ]
 
@@ -53,6 +60,20 @@ AUDIT_FIELDS = [
     "utr5_size",
     "cds_size",
     "utr3_size",
+]
+
+ORF_AUDIT_FIELDS = [
+    "transcript_id",
+    "gene_id",
+    "gene_name",
+    "orf_start_1based",
+    "orf_stop_1based",
+    "orf_frame",
+    "annotated",
+    "target_codon",
+    "in_utr5",
+    "status",
+    "reason",
 ]
 
 
@@ -140,6 +161,11 @@ def normalize_row(
         "utr3_size": len(utr3),
         "original_utr3_size": original_utr3_size,
         "utr3_truncated": int(utr3_truncated),
+        "screen_mode": "all_utr5",
+        "target_position_count": len(utr5),
+        "target_positions_1based": "",
+        "orf_target_count": 0,
+        "orf_targets_json": "[]",
         "variant_count": 1 + 4 * len(utr5),
     }
     audit.update(
@@ -209,6 +235,142 @@ def records_from_gtf(args) -> tuple[list[dict], list[dict]]:
         if genome is not None:
             genome.close()
     return records, audit_rows
+
+
+def finite_int(value, column_name: str, transcript_id: str) -> int:
+    if pd.isna(value):
+        raise ValueError(f"{transcript_id}: missing {column_name}")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{transcript_id}: non-integer {column_name}={value}")
+    return int(numeric)
+
+
+def load_orf_predictions(path: str | Path) -> dict[str, list[dict]]:
+    frame = pd.read_csv(path, dtype={"transcript_id": str})
+    required = {"transcript_id", "orf_start", "orf_stop", "orf_frame", "annotated"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"ORF prediction CSV is missing columns: {missing}")
+
+    predictions: dict[str, list[dict]] = {}
+    for _, row in frame.iterrows():
+        transcript_id = str(row["transcript_id"])
+        if not transcript_id or transcript_id == "nan":
+            continue
+        start = finite_int(row["orf_start"], "orf_start", transcript_id)
+        stop = finite_int(row["orf_stop"], "orf_stop", transcript_id)
+        frame_value = finite_int(row["orf_frame"], "orf_frame", transcript_id)
+        annotated = finite_int(row["annotated"], "annotated", transcript_id)
+        predictions.setdefault(transcript_id, []).append(
+            {
+                "orf_start_1based": start,
+                "orf_stop_1based": stop,
+                "orf_frame": frame_value,
+                "annotated": annotated,
+            }
+        )
+    return predictions
+
+
+def apply_orf_start_targets(
+    records: list[dict], orf_predictions_path: str | Path
+) -> tuple[list[dict], list[dict], dict[str, tuple[str, str]], int]:
+    """Restrict the screen to ATG start-codon bases fully inside the 5'UTR."""
+    predictions_by_tx = load_orf_predictions(orf_predictions_path)
+    filtered_records: list[dict] = []
+    orf_audit_rows: list[dict] = []
+    transcript_status: dict[str, tuple[str, str]] = {}
+    non_atg_count = 0
+
+    for record in records:
+        transcript_id = record["transcript_id"]
+        sequence = record["tx_sequence"]
+        utr5_size = int(record["utr5_size"])
+        predictions = predictions_by_tx.get(transcript_id, [])
+        if not predictions:
+            transcript_status[transcript_id] = ("excluded", "no_orf_prediction")
+            continue
+
+        target_positions: set[int] = set()
+        target_by_start: dict[int, dict] = {}
+        duplicate_counts: dict[int, int] = {}
+
+        for prediction in predictions:
+            start = int(prediction["orf_start_1based"])
+            stop = int(prediction["orf_stop_1based"])
+            frame_value = int(prediction["orf_frame"])
+            annotated = int(prediction["annotated"])
+            in_bounds = 1 <= start and start + 2 <= len(sequence)
+            codon = sequence[start - 1 : start + 2] if in_bounds else ""
+            in_utr5 = 1 <= start and start + 2 <= utr5_size
+            status = "excluded"
+            reason = ""
+
+            if not in_bounds:
+                reason = "orf_start_out_of_transcript_bounds"
+            elif codon != "ATG":
+                reason = "orf_start_not_ATG"
+                non_atg_count += 1
+            elif not in_utr5:
+                reason = "not_fully_in_utr5"
+            else:
+                status = "included"
+                reason = ""
+                duplicate_counts[start] = duplicate_counts.get(start, 0) + 1
+                if start not in target_by_start:
+                    positions = [start, start + 1, start + 2]
+                    target_by_start[start] = {
+                        "orf_start_1based": start,
+                        "orf_stop_1based": stop,
+                        "orf_frame": frame_value,
+                        "annotated": annotated,
+                        "target_codon": codon,
+                        "positions_1based": positions,
+                        "n_orfs_same_start": 1,
+                    }
+                    target_positions.update(positions)
+                else:
+                    existing = target_by_start[start]
+                    existing["annotated"] = max(int(existing["annotated"]), annotated)
+                    existing["n_orfs_same_start"] = duplicate_counts[start]
+
+            orf_audit_rows.append(
+                {
+                    "transcript_id": transcript_id,
+                    "gene_id": record.get("gene_id", ""),
+                    "gene_name": record.get("gene_name", ""),
+                    "orf_start_1based": start,
+                    "orf_stop_1based": stop,
+                    "orf_frame": frame_value,
+                    "annotated": annotated,
+                    "target_codon": codon,
+                    "in_utr5": int(in_utr5),
+                    "status": status,
+                    "reason": reason,
+                }
+            )
+
+        if not target_by_start:
+            transcript_status[transcript_id] = (
+                "excluded",
+                "no_valid_utr5_atg_orf_start",
+            )
+            continue
+
+        targets = [target_by_start[start] for start in sorted(target_by_start)]
+        positions = sorted(target_positions)
+        record = dict(record)
+        record["screen_mode"] = "orf_start_codon"
+        record["target_position_count"] = len(positions)
+        record["target_positions_1based"] = ";".join(str(pos) for pos in positions)
+        record["orf_target_count"] = len(targets)
+        record["orf_targets_json"] = json.dumps(targets, separators=(",", ":"))
+        record["variant_count"] = 1 + 4 * len(positions)
+        filtered_records.append(record)
+        transcript_status[transcript_id] = ("included", "orf_start_codon_screen")
+
+    return filtered_records, orf_audit_rows, transcript_status, non_atg_count
 
 
 def records_from_table(args) -> tuple[list[dict], list[dict]]:
@@ -281,6 +443,15 @@ def parse_args():
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--num-shards", type=int, default=128)
     parser.add_argument(
+        "--orf-predictions",
+        default=None,
+        help=(
+            "CSV/CSV.GZ with transcript_id,orf_start,orf_stop,orf_frame,annotated. "
+            "When provided, only ATG start-codon bases fully inside the 5'UTR "
+            "are mutated."
+        ),
+    )
+    parser.add_argument(
         "--no-truncate-utr3",
         dest="truncate_utr3",
         action="store_false",
@@ -343,6 +514,32 @@ def main():
     if not records:
         raise ValueError("No transcripts passed validation; inspect catalog_audit.tsv.gz")
 
+    orf_audit_rows: list[dict] = []
+    transcript_target_status: dict[str, tuple[str, str]] = {}
+    non_atg_orf_starts = 0
+    screen_mode = "all_utr5"
+    if args.orf_predictions:
+        if not Path(args.orf_predictions).is_file():
+            raise FileNotFoundError(f"ORF prediction CSV not found: {args.orf_predictions}")
+        records, orf_audit_rows, transcript_target_status, non_atg_orf_starts = (
+            apply_orf_start_targets(records, args.orf_predictions)
+        )
+        screen_mode = "orf_start_codon"
+        for audit in audit_rows:
+            if audit.get("status") != "included":
+                continue
+            status, reason = transcript_target_status.get(
+                audit["transcript_id"],
+                ("excluded", "no_orf_prediction"),
+            )
+            audit["status"] = status
+            audit["reason"] = "" if status == "included" else reason
+        if not records:
+            raise ValueError(
+                "No transcripts retained after ORF-start filtering; inspect "
+                "catalog_audit.tsv.gz and orf_target_audit.tsv.gz"
+            )
+
     for tx_index, record in enumerate(records):
         record["tx_index"] = tx_index
 
@@ -353,6 +550,17 @@ def main():
 
     write_dict_rows(catalog_dir / "transcripts.tsv.gz", CATALOG_FIELDS, records)
     write_dict_rows(catalog_dir / "catalog_audit.tsv.gz", AUDIT_FIELDS, audit_rows)
+    if args.orf_predictions:
+        write_dict_rows(
+            catalog_dir / "orf_target_audit.tsv.gz",
+            ORF_AUDIT_FIELDS,
+            orf_audit_rows,
+        )
+        if non_atg_orf_starts:
+            raise ValueError(
+                f"ORF start ATG check failed for {non_atg_orf_starts:,} "
+                "prediction rows. Inspect catalog/orf_target_audit.tsv.gz."
+            )
 
     shards = weighted_contiguous_shards(records, args.num_shards)
     shard_manifest_rows = []
@@ -363,7 +571,12 @@ def main():
             {
                 "shard_id": shard_id,
                 "transcript_count": len(shard_records),
-                "position_count": sum(int(row["utr5_size"]) for row in shard_records),
+                "position_count": sum(
+                    int(row["target_position_count"]) for row in shard_records
+                ),
+                "orf_target_count": sum(
+                    int(row["orf_target_count"]) for row in shard_records
+                ),
                 "variant_count": sum(int(row["variant_count"]) for row in shard_records),
                 "first_transcript_id": shard_records[0]["transcript_id"],
                 "last_transcript_id": shard_records[-1]["transcript_id"],
@@ -375,6 +588,7 @@ def main():
             "shard_id",
             "transcript_count",
             "position_count",
+            "orf_target_count",
             "variant_count",
             "first_transcript_id",
             "last_transcript_id",
@@ -382,10 +596,16 @@ def main():
         shard_manifest_rows,
     )
 
-    included_positions = sum(int(row["utr5_size"]) for row in records)
+    included_utr5_positions = sum(int(row["utr5_size"]) for row in records)
+    included_target_positions = sum(
+        int(row["target_position_count"]) for row in records
+    )
+    included_orf_targets = sum(int(row["orf_target_count"]) for row in records)
     manifest = {
         "species": args.species,
         "source": source,
+        "screen_mode": screen_mode,
+        "orf_predictions": str(args.orf_predictions) if args.orf_predictions else None,
         "truncate_utr3": args.truncate_utr3,
         "requested_shards": args.num_shards,
         "effective_shards": len(shards),
@@ -393,7 +613,9 @@ def main():
         "excluded_transcripts": sum(
             row.get("status") == "excluded" for row in audit_rows
         ),
-        "included_utr5_positions": included_positions,
+        "included_utr5_positions": included_utr5_positions,
+        "included_target_positions": included_target_positions,
+        "included_orf_targets": included_orf_targets,
         "total_variants": sum(int(row["variant_count"]) for row in records),
         "score_definition": (
             "mean predicted TE across all model output cell types and test folds"
@@ -403,7 +625,11 @@ def main():
 
     print(f"Included transcripts : {manifest['included_transcripts']:,}")
     print(f"Excluded transcripts : {manifest['excluded_transcripts']:,}")
+    print(f"Screen mode          : {manifest['screen_mode']}")
     print(f"5'UTR positions      : {manifest['included_utr5_positions']:,}")
+    print(f"Target positions     : {manifest['included_target_positions']:,}")
+    if args.orf_predictions:
+        print(f"ORF start codons     : {manifest['included_orf_targets']:,}")
     print(f"Prediction variants  : {manifest['total_variants']:,}")
     print(f"Effective shards     : {manifest['effective_shards']}")
     print(f"Catalog              : {catalog_dir / 'transcripts.tsv.gz'}")
