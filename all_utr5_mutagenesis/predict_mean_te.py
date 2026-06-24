@@ -22,6 +22,12 @@ def parse_args():
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--te-column",
+        default=None,
+        help="Use a single predicted_TE_* column instead of averaging all tissue types "
+             "(e.g. predicted_TE_normal_brain_tissue).",
+    )
     return parser.parse_args()
 
 
@@ -72,9 +78,11 @@ def main():
     accumulated = np.zeros(len(dm.df), dtype=np.float64)
     fold_count = 0
     folds = np.sort(run_df["params.test_fold"].unique())
+    te_column = args.te_column
     print(
         f"Predicting {len(dm.df):,} variants across {len(folds)} folds; "
-        f"top_k={args.top_k}, batch_size={args.batch_size}"
+        f"top_k={args.top_k}, batch_size={args.batch_size}; "
+        f"te_column={'mean(all)' if te_column is None else te_column}"
     )
     for test_fold in folds:
         fold_string = str(test_fold)
@@ -87,14 +95,23 @@ def main():
             dm,
             top_k_models_to_use=args.top_k,
         )
-        predicted_columns = [
-            column
-            for column in prediction_df.columns
-            if column.startswith("predicted_")
-        ]
-        if not predicted_columns:
-            raise ValueError(f"Fold {test_fold} produced no predicted_* columns")
-        accumulated += prediction_df[predicted_columns].mean(axis=1).to_numpy()
+        if te_column is not None:
+            if te_column not in prediction_df.columns:
+                raise ValueError(
+                    f"--te-column '{te_column}' not found in fold {test_fold} "
+                    f"predictions. Available columns: "
+                    f"{[c for c in prediction_df.columns if c.startswith('predicted_')]}"
+                )
+            accumulated += prediction_df[te_column].to_numpy()
+        else:
+            predicted_columns = [
+                column
+                for column in prediction_df.columns
+                if column.startswith("predicted_")
+            ]
+            if not predicted_columns:
+                raise ValueError(f"Fold {test_fold} produced no predicted_* columns")
+            accumulated += prediction_df[predicted_columns].mean(axis=1).to_numpy()
         fold_count += 1
         del prediction_df
         gc.collect()
