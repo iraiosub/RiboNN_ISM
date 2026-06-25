@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 
@@ -246,22 +247,109 @@ def finite_int(value, column_name: str, transcript_id: str) -> int:
     return int(numeric)
 
 
+def infer_table_sep(path: str | Path) -> str:
+    suffixes = "".join(Path(path).suffixes).lower()
+    if ".tsv" in suffixes or ".txt" in suffixes:
+        return "\t"
+    return ","
+
+
+def first_existing_column(columns: Iterable[str], aliases: tuple[str, ...]) -> str | None:
+    column_set = set(columns)
+    for alias in aliases:
+        if alias in column_set:
+            return alias
+    return None
+
+
+def parse_orf_id(value: str) -> dict[str, str]:
+    parts = str(value).rsplit("_", 3)
+    if len(parts) != 4:
+        raise ValueError(
+            f"Could not parse orf_id={value!r}; expected "
+            "<transcript_id>_<orf_start>_<orf_stop>_<orf_frame>"
+        )
+    transcript_id, start, stop, frame_value = parts
+    return {
+        "transcript_id": transcript_id,
+        "orf_start": start,
+        "orf_stop": stop,
+        "orf_frame": frame_value,
+    }
+
+
+def inferred_annotated_value(row, annotated_col: str | None, transcript_id: str) -> int:
+    if annotated_col:
+        return finite_int(row[annotated_col], annotated_col, transcript_id)
+    label = str(row.get("orf_label", row.get("model_class", ""))).lower()
+    if label and "theoretical" not in label:
+        return 1
+    return 0
+
+
 def load_orf_predictions(path: str | Path) -> dict[str, list[dict]]:
-    frame = pd.read_csv(path, dtype={"transcript_id": str})
-    required = {"transcript_id", "orf_start", "orf_stop", "orf_frame", "annotated"}
-    missing = sorted(required.difference(frame.columns))
-    if missing:
-        raise ValueError(f"ORF prediction CSV is missing columns: {missing}")
+    frame = pd.read_csv(path, sep=infer_table_sep(path), dtype=str)
+    aliases = {
+        "transcript_id": ("transcript_id", "tx_id"),
+        "orf_start": ("orf_start", "orf_start_1based"),
+        "orf_stop": ("orf_stop", "orf_stop_1based"),
+        "orf_frame": ("orf_frame", "frame"),
+        "annotated": ("annotated", "orf_annotated", "is_annotated"),
+    }
+    selected = {
+        key: first_existing_column(frame.columns, value)
+        for key, value in aliases.items()
+    }
+    needs_orf_id = any(
+        selected[key] is None
+        for key in ("transcript_id", "orf_start", "orf_stop", "orf_frame")
+    )
+    if needs_orf_id and "orf_id" not in frame.columns:
+        accepted = {
+            key: list(value)
+            for key, value in aliases.items()
+            if key != "annotated"
+        }
+        raise ValueError(
+            "ORF prediction table is missing coordinate columns. Expected "
+            f"aliases {accepted}, or an orf_id formatted as "
+            "<transcript_id>_<orf_start>_<orf_stop>_<orf_frame>."
+        )
 
     predictions: dict[str, list[dict]] = {}
+    seen: set[tuple[str, int, int, int]] = set()
     for _, row in frame.iterrows():
-        transcript_id = str(row["transcript_id"])
+        parsed_orf_id = parse_orf_id(row["orf_id"]) if needs_orf_id else {}
+        transcript_id = str(
+            row[selected["transcript_id"]]
+            if selected["transcript_id"]
+            else parsed_orf_id["transcript_id"]
+        )
         if not transcript_id or transcript_id == "nan":
             continue
-        start = finite_int(row["orf_start"], "orf_start", transcript_id)
-        stop = finite_int(row["orf_stop"], "orf_stop", transcript_id)
-        frame_value = finite_int(row["orf_frame"], "orf_frame", transcript_id)
-        annotated = finite_int(row["annotated"], "annotated", transcript_id)
+        start_source = (
+            row[selected["orf_start"]]
+            if selected["orf_start"]
+            else parsed_orf_id["orf_start"]
+        )
+        stop_source = (
+            row[selected["orf_stop"]]
+            if selected["orf_stop"]
+            else parsed_orf_id["orf_stop"]
+        )
+        frame_source = (
+            row[selected["orf_frame"]]
+            if selected["orf_frame"]
+            else parsed_orf_id["orf_frame"]
+        )
+        start = finite_int(start_source, "orf_start", transcript_id)
+        stop = finite_int(stop_source, "orf_stop", transcript_id)
+        frame_value = finite_int(frame_source, "orf_frame", transcript_id)
+        annotated = inferred_annotated_value(row, selected["annotated"], transcript_id)
+        key = (transcript_id, start, stop, frame_value)
+        if key in seen:
+            continue
+        seen.add(key)
         predictions.setdefault(transcript_id, []).append(
             {
                 "orf_start_1based": start,

@@ -22,6 +22,9 @@ MAX_CDS_UTR3_LEN = 11_937
 MAX_TX_LEN = MAX_UTR5_LEN + MAX_CDS_UTR3_LEN
 
 DEFAULT_REF_ROOT = Path("/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref")
+DEFAULT_ANALYSIS_RESULTS_ROOT = Path(
+    "/camp/lab/ulej/home/shared/oscar_ira_riboloco/analysis_results"
+)
 DEFAULT_REFS = {
     "human": {
         "genome_fasta": DEFAULT_REF_ROOT
@@ -42,10 +45,8 @@ DEFAULT_REFS = {
         "gtf": DEFAULT_REF_ROOT
         / "mouse"
         / "gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz",
-        "orf_predictions": DEFAULT_REF_ROOT
-        / "mouse"
-        / "orfs"
-        / "gencode.vM33.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz",
+        "orf_predictions": DEFAULT_ANALYSIS_RESULTS_ROOT
+        / "cross_tissue.unmixing.master_table.with_below_tpm_threshold.tsv.gz",
     },
 }
 

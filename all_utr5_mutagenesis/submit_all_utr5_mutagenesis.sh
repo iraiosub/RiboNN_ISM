@@ -67,7 +67,8 @@ Usage:
 Input options:
   --repo-root PATH          RiboNN_ISM checkout root; normally auto-detected
   --species human|mouse
-  --orf-predictions PATH    ORF prediction CSV.GZ; defaults to ref/<species>/orfs
+  --orf-predictions PATH    ORF prediction/master table; defaults are
+                            species-specific
   --all-utr5                Mutate every retained 5'UTR base instead of ORF starts
   --transcript-fasta PATH   Full transcript FASTA; requires --gtf
   --genome-fasta PATH       Reconstruct transcripts from genome FASTA + GTF
@@ -79,8 +80,9 @@ Scaling options:
   --max-concurrent N        Concurrent GPUs (default: 8)
   --batch-size N            RiboNN inference batch (default: 256)
   --top-k N                 Models per fold (default: 5)
-  --te-column NAME          Single predicted_TE_* column to use instead of averaging
-                            all tissue types (default: predicted_TE_normal_brain_tissue)
+  --te-column NAME|mean_all Single predicted_TE_* column to use instead of averaging
+                            all tissue types (default: human uses
+                            predicted_TE_normal_brain_tissue; mouse uses mean_all)
   --partition NAME          GPU partition (default: ga100)
   --gpu-time HH:MM:SS       Per-array-task limit (default: 12:00:00)
   --gpu-mem SIZE            Per-array-task RAM (default: 32G)
@@ -97,6 +99,7 @@ EOF
 
 SPECIES="${RIBONN_SPECIES:-human}"
 REF_ROOT="${RIBONN_REF_ROOT:-/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref}"
+ANALYSIS_RESULTS_ROOT="${RIBONN_ANALYSIS_RESULTS_ROOT:-/camp/lab/ulej/home/shared/oscar_ira_riboloco/analysis_results}"
 REPO_ROOT_OVERRIDE=""
 TRANSCRIPT_FASTA=""
 GENOME_FASTA=""
@@ -109,7 +112,13 @@ NUM_SHARDS=128
 MAX_CONCURRENT=8
 BATCH_SIZE=256
 TOP_K=5
-TE_COLUMN="predicted_TE_normal_brain_tissue"
+if [[ -n "${RIBONN_TE_COLUMN+x}" ]]; then
+    TE_COLUMN="${RIBONN_TE_COLUMN}"
+    TE_COLUMN_SET=1
+else
+    TE_COLUMN=""
+    TE_COLUMN_SET=0
+fi
 GPU_PARTITION="ga100"
 GPU_TIME="12:00:00"
 GPU_MEM="32G"
@@ -131,7 +140,7 @@ while [[ $# -gt 0 ]]; do
         --max-concurrent) MAX_CONCURRENT="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --top-k) TOP_K="$2"; shift 2 ;;
-        --te-column) TE_COLUMN="$2"; shift 2 ;;
+        --te-column) TE_COLUMN="$2"; TE_COLUMN_SET=1; shift 2 ;;
         --partition) GPU_PARTITION="$2"; shift 2 ;;
         --gpu-time) GPU_TIME="$2"; shift 2 ;;
         --gpu-mem) GPU_MEM="$2"; shift 2 ;;
@@ -166,12 +175,22 @@ case "${SPECIES}" in
     mouse)
         DEFAULT_GENOME="${REF_ROOT}/mouse/GRCm39.primary_assembly.genome.fa"
         DEFAULT_GTF="${REF_ROOT}/mouse/gencode.vM33.primary_assembly.annotation.longest_cds_transcripts.gtf.gz"
-        DEFAULT_ORF_PREDICTIONS="${REF_ROOT}/mouse/orfs/gencode.vM33.primary_assembly.annotation.longest_cds.transcript_info.orf_predictions.csv.gz"
+        DEFAULT_ORF_PREDICTIONS="${ANALYSIS_RESULTS_ROOT}/cross_tissue.unmixing.master_table.with_below_tpm_threshold.tsv.gz"
         ;;
     *)
         echo "[ERROR] --species must be human or mouse." >&2
         exit 2
         ;;
+esac
+
+if [[ "${TE_COLUMN_SET}" -eq 0 ]]; then
+    case "${SPECIES}" in
+        human) TE_COLUMN="predicted_TE_normal_brain_tissue" ;;
+        mouse) TE_COLUMN="" ;;
+    esac
+fi
+case "${TE_COLUMN}" in
+    mean_all|all|none|"") TE_COLUMN="" ;;
 esac
 
 if [[ -n "${INPUT_TABLE}" && ( -n "${TRANSCRIPT_FASTA}" || -n "${GENOME_FASTA}" ) ]]; then
@@ -192,12 +211,18 @@ GENOME_FASTA="${GENOME_FASTA:-${DEFAULT_GENOME}}"
 if [[ "${ALL_UTR5}" -eq 0 ]]; then
     ORF_PREDICTIONS="${ORF_PREDICTIONS:-${DEFAULT_ORF_PREDICTIONS}}"
 fi
-TE_SUFFIX="${TE_COLUMN#predicted_TE_}"   # strip leading predicted_TE_ for readability
+if [[ -n "${TE_COLUMN}" ]]; then
+    TE_LABEL="${TE_COLUMN#predicted_TE_}"   # strip leading predicted_TE_ for readability
+    TE_DISPLAY="${TE_COLUMN}"
+else
+    TE_LABEL="mean_all_tissues"
+    TE_DISPLAY="mean(all predicted_TE columns)"
+fi
 RUN_LABEL="orf_start_codon"
-DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_orf_starts_${TE_SUFFIX}"
+DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_orf_starts_${TE_LABEL}"
 if [[ "${ALL_UTR5}" -eq 1 ]]; then
     RUN_LABEL="all_utr5"
-    DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_all_utr5_${TE_SUFFIX}"
+    DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_all_utr5_${TE_LABEL}"
 fi
 OUTDIR="${OUTDIR:-${DEFAULT_OUTDIR}}"
 
@@ -239,7 +264,7 @@ echo "Array shards    : ${NUM_SHARDS}"
 echo "Concurrent GPUs : ${MAX_CONCURRENT}"
 echo "GPU partition   : ${GPU_PARTITION}"
 echo "Batch / top-k   : ${BATCH_SIZE} / ${TOP_K}"
-echo "TE column       : ${TE_COLUMN}"
+echo "TE score        : ${TE_DISPLAY}"
 echo "Keep large files: ${KEEP_INTERMEDIATES}"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -328,6 +353,11 @@ fi
 mkdir -p "\${SHARD_WORK}" "${OUTDIR}/summaries"
 python -c "import torch, sys; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available()); sys.exit('[ERROR] CUDA unavailable') if not torch.cuda.is_available() else print('GPU:', torch.cuda.get_device_name(0))"
 
+PREDICT_TE_ARGS=()
+if [[ -n "${TE_COLUMN}" ]]; then
+    PREDICT_TE_ARGS=(--te-column "${TE_COLUMN}")
+fi
+
 python all_utr5_mutagenesis/make_shard_input.py \
     --catalog "\${SHARD_CATALOG}" \
     --output "\${SHARD_INPUT}"
@@ -340,7 +370,7 @@ python all_utr5_mutagenesis/predict_mean_te.py \
     --top-k "${TOP_K}" \
     --batch-size "${BATCH_SIZE}" \
     --num-workers "\${SLURM_CPUS_PER_TASK:-4}" \
-    --te-column "${TE_COLUMN}"
+    "\${PREDICT_TE_ARGS[@]}"
 
 python all_utr5_mutagenesis/summarize_shard.py \
     --catalog "\${SHARD_CATALOG}" \

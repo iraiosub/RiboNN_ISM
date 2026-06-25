@@ -14,9 +14,9 @@ each retained ORF start codon is `ATG`.
 It predicts RiboNN TE changes without producing per-transcript heatmaps. The
 main outputs are:
 
-- `output/<species>_orf_starts/final/all_utr5_position_scores.tsv.gz`: one row
+- `output/<species>_orf_starts_<te_label>/final/all_utr5_position_scores.tsv.gz`: one row
   per targeted 5′UTR base
-- `output/<species>_orf_starts/final/orf_start_codon_scores.tsv.gz`: one row
+- `output/<species>_orf_starts_<te_label>/final/orf_start_codon_scores.tsv.gz`: one row
   per retained ORF start codon, averaging the three start-codon positions
 
 Important columns are:
@@ -38,21 +38,36 @@ The ORF-level table adds:
 - `orf_deletion_te_change_mean_3nt`
 - direction columns for those three-position averages
 
-Here, mean predicted TE is averaged across the RiboNN output cell types and
-test folds, matching the scalar `mean_predicted_TE` idea used by the existing
-SCN2A workflow.
+Here, mean predicted TE is the scalar passed to the downstream summaries:
+human defaults to `predicted_TE_normal_brain_tissue` averaged across folds,
+while mouse defaults to the average across all mouse RiboNN output cell types
+and folds. Pass `--te-column mean_all` to use the all-output average for any
+species.
 
 ## Input choice
 
 The default is the same species-specific genome FASTA plus
 `longest_cds_transcripts.gtf.gz` reference used by the existing SCN2A RiboNN
-analyses, and the species-specific ORF prediction file under
-`/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/<species>/orfs`:
+analyses. Human ORF-start mode uses the human ORF prediction file under
+`/camp/lab/ulej/home/shared/oscar_ira_riboloco/ref/human/orfs`. Mouse ORF-start
+mode uses the unified cross-tissue master table:
+`/camp/lab/ulej/home/shared/oscar_ira_riboloco/analysis_results/cross_tissue.unmixing.master_table.with_below_tpm_threshold.tsv.gz`.
 
 ```bash
 bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
   --species human
 ```
+
+For the mouse cross-tissue run:
+
+```bash
+bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
+  --species mouse
+```
+
+Mouse defaults to averaging all mouse RiboNN predicted TE outputs across folds,
+so the default output directory is
+`output/mouse_orf_starts_mean_all_tissues`.
 
 Run the launcher from the checkout with `bash`; it submits the prep, GPU-array,
 and merge jobs itself. If a site wrapper or accidental `sbatch` call executes a
@@ -71,6 +86,11 @@ bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
   --species human \
   --orf-predictions /path/to/orf_predictions.csv.gz
 ```
+
+The ORF table may be a CSV ORF-prediction file with
+`transcript_id,orf_start,orf_stop,orf_frame,annotated`, or a TSV master table
+with `orf_start_1based`/`orf_stop_1based` aliases or an `orf_id` formatted as
+`<transcript_id>_<orf_start>_<orf_stop>_<orf_frame>`.
 
 To use a full transcript FASTA directly, provide the matching GTF so that the
 workflow can locate the 5′UTR/CDS boundaries:

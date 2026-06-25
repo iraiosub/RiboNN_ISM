@@ -50,17 +50,73 @@ codon_pos_labels <- c("1 (A)", "2 (T/U)", "3 (G)")
 # Load data
 # ============================================================
 
-ism_results.dir <- "/Volumes/lab-ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/human_orf_starts/summaries"
+default_shared_root <- if (dir.exists("/camp/lab/ulej/home/shared/oscar_ira_riboloco")) {
+  "/camp/lab/ulej/home/shared/oscar_ira_riboloco"
+} else {
+  "/Volumes/lab-ulej/home/shared/oscar_ira_riboloco"
+}
+shared_root <- Sys.getenv("RIBONN_SHARED_ROOT", default_shared_root)
+analysis_results.dir <- Sys.getenv(
+  "RIBONN_ANALYSIS_RESULTS_DIR",
+  file.path(shared_root, "analysis_results")
+)
+output_root.dir <- Sys.getenv(
+  "RIBONN_UTR5_OUTPUT_ROOT",
+  file.path(shared_root, "RiboNN_ISM", "all_utr5_mutagenesis", "output")
+)
 
-ism.ls <- list.files(ism_results.dir, pattern = "\\.orfs\\.tsv\\.gz$", full.names = TRUE)
+species <- Sys.getenv("RIBONN_ORF_SPECIES", "human")
+if (!species %in% c("human", "mouse")) {
+  stop("RIBONN_ORF_SPECIES must be 'human' or 'mouse'")
+}
+default_te_label <- if (species == "mouse") "mean_all_tissues" else "normal_brain_tissue"
+te_label <- Sys.getenv("RIBONN_ORF_TE_LABEL", default_te_label)
+ism_results.dir <- Sys.getenv(
+  "RIBONN_ORF_RESULTS_DIR",
+  file.path(output_root.dir, paste0(species, "_orf_starts_", te_label))
+)
+ism_summary.dir <- if (dir.exists(file.path(ism_results.dir, "summaries"))) {
+  file.path(ism_results.dir, "summaries")
+} else {
+  ism_results.dir
+}
+
+default_master_tables <- c(
+  human = file.path(
+    analysis_results.dir,
+    "human_brain.unmixing.master_table.with_below_tpm_threshold.tsv.gz"
+  ),
+  mouse = file.path(
+    analysis_results.dir,
+    "cross_tissue.unmixing.master_table.with_below_tpm_threshold.tsv.gz"
+  )
+)
+master_table <- Sys.getenv("RIBONN_ORF_MASTER_TABLE", default_master_tables[[species]])
+
+cat("Species:", species, "\n")
+cat("ISM summaries:", ism_summary.dir, "\n")
+cat("Master table:", master_table, "\n")
+
+ism.ls <- list.files(ism_summary.dir, pattern = "\\.orfs\\.tsv\\.gz$", full.names = TRUE)
+if (length(ism.ls) == 0) {
+  stop("No shard ORF summaries found in ", ism_summary.dir)
+}
 ism.df <- rbindlist(lapply(ism.ls, fread))
 
-pos.ls <- list.files(ism_results.dir, pattern = "\\.positions\\.tsv\\.gz$", full.names = TRUE)
+pos.ls <- list.files(ism_summary.dir, pattern = "\\.positions\\.tsv\\.gz$", full.names = TRUE)
+if (length(pos.ls) == 0) {
+  stop("No shard position summaries found in ", ism_summary.dir)
+}
 pos.df <- rbindlist(lapply(pos.ls, fread))
 
-human.master.df <- fread("/Volumes/lab-ulej/home/shared/oscar_ira_riboloco/analysis_results/human_brain.unmixing.master_table.with_below_tpm_threshold.tsv.gz")
+master.df <- fread(master_table)
+required_master_cols <- c("transcript_id", "orf_id", "orf_label", "tpm_threshold_group", "orf_rel_to_cds")
+missing_master_cols <- setdiff(required_master_cols, names(master.df))
+if (length(missing_master_cols) > 0) {
+  stop("Master table is missing required columns: ", paste(missing_master_cols, collapse = ", "))
+}
 
-human.master.df <- human.master.df %>%
+master.df <- master.df %>%
   mutate(orf_definition = case_when(
     orf_label == "Upstream ORF" ~ "uORF",
     orf_label == "Upstream overlapping ORF" ~ "uoORF",
@@ -69,12 +125,12 @@ human.master.df <- human.master.df %>%
     TRUE ~ NA_character_
   ))
 
-master_orf_def.df <- human.master.df %>%
+master_orf_def.df <- master.df %>%
   filter(!is.na(orf_definition)) %>%
   distinct(orf_id, orf_definition)
 
 # Sub-stratified definition: theoreticals split by orf_rel_to_cds (uORF vs uoORF structure)
-master_orf_def_sub.df <- human.master.df %>%
+master_orf_def_sub.df <- master.df %>%
   filter(!is.na(orf_definition)) %>%
   mutate(orf_definition_sub = case_when(
     orf_definition == "uORF"  ~ "uORF",
@@ -98,7 +154,7 @@ master_orf_def_sub.df <- human.master.df %>%
 # ============================================================
 
 ism.df <- ism.df %>%
-  semi_join(human.master.df, by = "transcript_id") %>%
+  semi_join(master.df, by = "transcript_id") %>%
   tidyr::unite("orf_id", transcript_id, orf_start_1based, orf_stop_1based, orf_frame,
                sep = "_", remove = TRUE) %>%
   left_join(master_orf_def.df, by = "orf_id") %>%
@@ -182,9 +238,9 @@ del_dir_bar.gg <- direction_bar(
 # ============================================================
 
 scatter.gg <- ggplot(ism.df,
-    aes(x = orf_substitution_te_change_mean_3nt,
-        y = orf_deletion_te_change_mean_3nt,
-        colour = orf_definition)) +
+                     aes(x = orf_substitution_te_change_mean_3nt,
+                         y = orf_deletion_te_change_mean_3nt,
+                         colour = orf_definition)) +
   geom_point(alpha = 0.25, size = 0.8, stroke = 0) +
   geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.4) +
   geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.4) +
@@ -245,7 +301,7 @@ codon_del.gg <- summarise_by_codon_pos(pos.df, "deletion_te_change") %>%
 # ============================================================
 
 codon_pos_violin_sub.gg <- ggplot(pos.df,
-    aes(x = pos_label, y = substitution_te_change_mean, fill = orf_definition)) +
+                                  aes(x = pos_label, y = substitution_te_change_mean, fill = orf_definition)) +
   geom_violin(scale = "width", linewidth = 0.3) +
   geom_boxplot(fill = "white", alpha = 0.5, width = 0.08, outlier.shape = NA) +
   scale_fill_manual(values = orf_definition_colors) +
@@ -256,7 +312,7 @@ codon_pos_violin_sub.gg <- ggplot(pos.df,
   guides(fill = "none")
 
 codon_pos_violin_del.gg <- ggplot(pos.df,
-    aes(x = pos_label, y = deletion_te_change, fill = orf_definition)) +
+                                  aes(x = pos_label, y = deletion_te_change, fill = orf_definition)) +
   geom_violin(scale = "width", linewidth = 0.3) +
   geom_boxplot(fill = "white", alpha = 0.5, width = 0.08, outlier.shape = NA) +
   scale_fill_manual(values = orf_definition_colors) +
@@ -306,7 +362,7 @@ orf_long.df <- orf_wide.df %>%
   )
 
 meta_heatmap.gg <- ggplot(orf_long.df,
-    aes(x = pos_label, y = orf_rank, fill = value_clamped)) +
+                          aes(x = pos_label, y = orf_rank, fill = value_clamped)) +
   geom_raster() +
   scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",
                        midpoint = 0, name = "ΔTE",
@@ -360,7 +416,7 @@ meta_dist_theme <- list(
 )
 
 meta_dist_sub.gg <- ggplot(meta_dist_sub,
-    aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
+                           aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
   geom_tile() +
   labs(
     x     = "Distance of ORF start from CDS (nt, negative = upstream)",
@@ -370,7 +426,7 @@ meta_dist_sub.gg <- ggplot(meta_dist_sub,
   meta_dist_theme
 
 meta_dist_del.gg <- ggplot(meta_dist_del,
-    aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
+                           aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
   geom_tile() +
   labs(
     x     = "Distance of ORF start from CDS (nt, negative = upstream)",
@@ -493,7 +549,7 @@ meta_dist_sub_theme <- list(
 )
 
 meta_dist_sub_sub.gg <- ggplot(meta_dist_sub_grid_sub,
-    aes(x = dist_bin, y = fct_rev(orf_definition_sub), fill = mean_change)) +
+                               aes(x = dist_bin, y = fct_rev(orf_definition_sub), fill = mean_change)) +
   geom_tile() +
   labs(
     x     = "Distance of ORF start from CDS (nt, negative = upstream)",
@@ -503,7 +559,7 @@ meta_dist_sub_sub.gg <- ggplot(meta_dist_sub_grid_sub,
   meta_dist_sub_theme
 
 meta_dist_sub_del.gg <- ggplot(meta_dist_sub_grid_del,
-    aes(x = dist_bin, y = fct_rev(orf_definition_sub), fill = mean_change)) +
+                               aes(x = dist_bin, y = fct_rev(orf_definition_sub), fill = mean_change)) +
   geom_tile() +
   labs(
     x     = "Distance of ORF start from CDS (nt, negative = upstream)",
