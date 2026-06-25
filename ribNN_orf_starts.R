@@ -69,7 +69,7 @@ species <- Sys.getenv("RIBONN_ORF_SPECIES", "human")
 if (!species %in% c("human", "mouse")) {
   stop("RIBONN_ORF_SPECIES must be 'human' or 'mouse'")
 }
-default_te_label <- if (species == "mouse") "mean_all_tissues" else "normal_brain_tissue"
+default_te_label <- if (species == "mouse") "mean_predicted_TE" else "normal_brain_tissue"
 te_label <- Sys.getenv("RIBONN_ORF_TE_LABEL", default_te_label)
 ism_results.dir <- Sys.getenv(
   "RIBONN_ORF_RESULTS_DIR",

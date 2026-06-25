@@ -80,9 +80,11 @@ Scaling options:
   --max-concurrent N        Concurrent GPUs (default: 8)
   --batch-size N            RiboNN inference batch (default: 256)
   --top-k N                 Models per fold (default: 5)
-  --te-column NAME|mean_all Single predicted_TE_* column to use instead of averaging
-                            all tissue types (default: human uses
-                            predicted_TE_normal_brain_tissue; mouse uses mean_all)
+  --te-column NAME|mean_predicted_TE
+                            Single predicted_TE_* column to use instead of the
+                            repo-standard mean_predicted_TE aggregation
+                            (default: human uses predicted_TE_normal_brain_tissue;
+                            mouse uses mean_predicted_TE)
   --partition NAME          GPU partition (default: ga100)
   --gpu-time HH:MM:SS       Per-array-task limit (default: 12:00:00)
   --gpu-mem SIZE            Per-array-task RAM (default: 32G)
@@ -190,7 +192,7 @@ if [[ "${TE_COLUMN_SET}" -eq 0 ]]; then
     esac
 fi
 case "${TE_COLUMN}" in
-    mean_all|all|none|"") TE_COLUMN="" ;;
+    mean_predicted_TE|mean_all|all|generic|none|"") TE_COLUMN="" ;;
 esac
 
 if [[ -n "${INPUT_TABLE}" && ( -n "${TRANSCRIPT_FASTA}" || -n "${GENOME_FASTA}" ) ]]; then
@@ -215,8 +217,8 @@ if [[ -n "${TE_COLUMN}" ]]; then
     TE_LABEL="${TE_COLUMN#predicted_TE_}"   # strip leading predicted_TE_ for readability
     TE_DISPLAY="${TE_COLUMN}"
 else
-    TE_LABEL="mean_all_tissues"
-    TE_DISPLAY="mean(all predicted_TE columns)"
+    TE_LABEL="mean_predicted_TE"
+    TE_DISPLAY="mean_predicted_TE (mean of predicted_TE_* columns)"
 fi
 RUN_LABEL="orf_start_codon"
 DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_orf_starts_${TE_LABEL}"

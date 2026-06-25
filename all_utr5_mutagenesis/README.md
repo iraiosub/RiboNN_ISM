@@ -38,11 +38,12 @@ The ORF-level table adds:
 - `orf_deletion_te_change_mean_3nt`
 - direction columns for those three-position averages
 
-Here, mean predicted TE is the scalar passed to the downstream summaries:
-human defaults to `predicted_TE_normal_brain_tissue` averaged across folds,
-while mouse defaults to the average across all mouse RiboNN output cell types
-and folds. Pass `--te-column mean_all` to use the all-output average for any
-species.
+Here, `mean_predicted_TE` matches the repository's prediction wrapper: it is
+computed after native multitask prediction as the mean across all
+`predicted_TE_*` outputs, then across folds. Human defaults to
+`predicted_TE_normal_brain_tissue` averaged across folds, while mouse defaults
+to `mean_predicted_TE`. Pass `--te-column mean_predicted_TE` to use this
+all-output aggregate for any species.
 
 ## Input choice
 
@@ -67,7 +68,7 @@ bash all_utr5_mutagenesis/submit_all_utr5_mutagenesis.sh \
 
 Mouse defaults to averaging all mouse RiboNN predicted TE outputs across folds,
 so the default output directory is
-`output/mouse_orf_starts_mean_all_tissues`.
+`output/mouse_orf_starts_mean_predicted_TE`.
 
 Run the launcher from the checkout with `bash`; it submits the prep, GPU-array,
 and merge jobs itself. If a site wrapper or accidental `sbatch` call executes a
