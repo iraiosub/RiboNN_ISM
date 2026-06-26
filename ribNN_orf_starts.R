@@ -820,6 +820,67 @@ codon_pos_long_summary <- function(df, group_cols) {
                            mean_del = "Deletion"))
 }
 
+mutation_matrix_long <- function(df) {
+  required_cols <- c(
+    "substitution_A_te_change",
+    "substitution_C_te_change",
+    "substitution_G_te_change",
+    "substitution_T_te_change",
+    "deletion_te_change"
+  )
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Position summaries are missing per-alt-base ΔTE columns: ",
+      paste(missing_cols, collapse = ", "),
+      ". Rerun the mutagenesis summarization with the updated ",
+      "summarize_shard.py before making mutation-matrix heatmaps."
+    )
+  }
+  to_numeric <- function(x) suppressWarnings(as.numeric(x))
+
+  df %>%
+    mutate(
+      ref_label = recode(ref_base, T = "U"),
+      substitution_A_te_change = if_else(
+        ref_base == "A", 0, to_numeric(substitution_A_te_change)
+      ),
+      substitution_C_te_change = if_else(
+        ref_base == "C", 0, to_numeric(substitution_C_te_change)
+      ),
+      substitution_G_te_change = if_else(
+        ref_base == "G", 0, to_numeric(substitution_G_te_change)
+      ),
+      substitution_T_te_change = if_else(
+        ref_base == "T", 0, to_numeric(substitution_T_te_change)
+      ),
+      deletion_te_change = to_numeric(deletion_te_change)
+    ) %>%
+    pivot_longer(
+      cols = all_of(required_cols),
+      names_to = "mutation",
+      values_to = "delta_te"
+    ) %>%
+    mutate(
+      mutation = recode(
+        mutation,
+        substitution_A_te_change = "A",
+        substitution_C_te_change = "C",
+        substitution_G_te_change = "G",
+        substitution_T_te_change = "U",
+        deletion_te_change = "del"
+      ),
+      mutation = factor(mutation, levels = c("A", "C", "G", "U", "del")),
+      ref_label = factor(ref_label, levels = c("A", "U", "G"))
+    ) %>%
+    group_by(distance_bin, detected_group, ref_label, mutation) %>%
+    summarise(
+      mean_val = mean(delta_te, na.rm = TRUE),
+      n = sum(!is.na(delta_te)),
+      .groups = "drop"
+    )
+}
+
 orf_effect_long <- function(df) {
   df %>%
     pivot_longer(
@@ -917,18 +978,15 @@ make_distance_bin_plot <- function(structural_type, heatmap_low, heatmap_high) {
     guide = guide_colourbar(barheight = unit(14, "mm"), barwidth = unit(3, "mm"))
   )
 
-  heatmap_plot <- codon_pos_long_summary(
-      hm_df,
-      c("distance_bin", "detected_group")
-    ) %>%
-    ggplot(aes(x = metric, y = fct_rev(pos_label), fill = mean_val)) +
+  heatmap_plot <- mutation_matrix_long(hm_df) %>%
+    ggplot(aes(x = mutation, y = fct_rev(ref_label), fill = mean_val)) +
     geom_tile(colour = "white", linewidth = 0.5) +
     geom_text(aes(label = sprintf("%.3f", mean_val)), size = 2.2) +
     facet_grid(distance_bin ~ detected_group) +
     heatmap_fill +
     scale_x_discrete(expand = expansion(add = 0)) +
     scale_y_discrete(expand = expansion(add = 0.3)) +
-    labs(x = NULL, y = "Codon\nposition") +
+    labs(x = NULL, y = "Reference\nbase") +
     pos_hm_theme
 
   cowplot::plot_grid(box_plot, heatmap_plot, ncol = 1,

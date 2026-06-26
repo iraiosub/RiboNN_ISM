@@ -8,7 +8,7 @@ import csv
 import json
 from pathlib import Path
 
-from workflow_common import open_text, parse_variant_id
+from workflow_common import BASES, open_text, parse_variant_id
 
 
 OUTPUT_FIELDS = [
@@ -31,6 +31,14 @@ OUTPUT_FIELDS = [
     "substitution_te_change_mean",
     "substitution_te_change_min",
     "substitution_te_change_max",
+    "substitution_A_mean_predicted_TE",
+    "substitution_A_te_change",
+    "substitution_C_mean_predicted_TE",
+    "substitution_C_te_change",
+    "substitution_G_mean_predicted_TE",
+    "substitution_G_te_change",
+    "substitution_T_mean_predicted_TE",
+    "substitution_T_te_change",
     "substitution_direction_vs_wt",
     "substitution_effect_pattern",
     "deletion_mean_predicted_TE",
@@ -132,9 +140,9 @@ def main():
             if parsed["kind"] == "wt":
                 tx_effects["wt"] = score
             elif parsed["kind"] == "sub":
-                tx_effects["sub"].setdefault(parsed["position_1based"], []).append(
-                    score
-                )
+                tx_effects["sub"].setdefault(parsed["position_1based"], {})[
+                    parsed["alt"]
+                ] = score
             elif parsed["kind"] == "del":
                 tx_effects["del"][parsed["position_1based"]] = score
 
@@ -196,7 +204,8 @@ def main():
                 position_summaries: dict[int, dict] = {}
                 for pos1 in positions:
                     ref = sequence[pos1 - 1]
-                    substitution_scores = effects[tx_index]["sub"].get(pos1, [])
+                    substitution_by_alt = effects[tx_index]["sub"].get(pos1, {})
+                    substitution_scores = list(substitution_by_alt.values())
                     deletion_score = effects[tx_index]["del"].get(pos1)
                     if len(substitution_scores) != 3:
                         raise ValueError(
@@ -217,6 +226,21 @@ def main():
                         substitution_deltas
                     )
                     deletion_delta = deletion_score - wt
+                    substitution_by_base = {}
+                    for base in BASES:
+                        if base == ref:
+                            substitution_by_base[base] = ("", "")
+                            continue
+                        score = substitution_by_alt.get(base)
+                        if score is None:
+                            raise ValueError(
+                                f"tx_index={tx_index}, position={pos1}: "
+                                f"missing {ref}>{base} substitution"
+                            )
+                        substitution_by_base[base] = (
+                            f"{score:.10g}",
+                            f"{score - wt:.10g}",
+                        )
                     orf_meta = position_to_orf.get(pos1, {})
                     row_out = {
                         "tx_index": tx_index,
@@ -246,6 +270,14 @@ def main():
                         "substitution_te_change_max": (
                             f"{max(substitution_deltas):.10g}"
                         ),
+                        "substitution_A_mean_predicted_TE": substitution_by_base["A"][0],
+                        "substitution_A_te_change": substitution_by_base["A"][1],
+                        "substitution_C_mean_predicted_TE": substitution_by_base["C"][0],
+                        "substitution_C_te_change": substitution_by_base["C"][1],
+                        "substitution_G_mean_predicted_TE": substitution_by_base["G"][0],
+                        "substitution_G_te_change": substitution_by_base["G"][1],
+                        "substitution_T_mean_predicted_TE": substitution_by_base["T"][0],
+                        "substitution_T_te_change": substitution_by_base["T"][1],
                         "substitution_direction_vs_wt": direction(
                             substitution_delta_mean, args.direction_tolerance
                         ),
