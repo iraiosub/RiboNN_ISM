@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from workflow_common import MAX_CDS_UTR3_LEN, MAX_TX_LEN, MAX_UTR5_LEN
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -64,8 +66,9 @@ def main():
 
     config = extract_config(run_df, run_df.run_id.iloc[0])
     config["species"] = args.species
-    config["max_utr5_len"] = 1_381
-    config["max_cds_utr3_len"] = 11_937
+    config["max_utr5_len"] = MAX_UTR5_LEN
+    config["max_cds_utr3_len"] = MAX_CDS_UTR3_LEN
+    config["max_seq_len"] = MAX_TX_LEN
     config["tx_info_path"] = str(input_path)
     config["num_workers"] = args.num_workers
     config["test_batch_size"] = args.batch_size
@@ -75,6 +78,18 @@ def main():
 
     if dm.df.empty:
         raise ValueError("RiboNN removed every input variant")
+    input_ids = pd.read_csv(input_path, sep="\t", usecols=["tx_id"])[
+        "tx_id"
+    ].astype(str)
+    kept_ids = set(dm.df["tx_id"].astype(str))
+    dropped_ids = input_ids.loc[~input_ids.isin(kept_ids)]
+    if not dropped_ids.empty:
+        examples = ", ".join(dropped_ids.head(10).tolist())
+        raise ValueError(
+            f"RiboNN filtered {len(dropped_ids):,} input variants before prediction. "
+            "This would make ΔTE summaries invalid because a transcript may be "
+            f"missing its WT baseline. First dropped variant IDs: {examples}"
+        )
     if dm.df["tx_id"].duplicated().any():
         raise ValueError("Variant IDs are not unique within the shard")
 

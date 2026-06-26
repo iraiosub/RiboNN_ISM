@@ -198,7 +198,14 @@ def main():
                         position_to_orf[int(pos1)] = position_meta
 
                 if tx_index not in effects or effects[tx_index]["wt"] is None:
-                    raise ValueError(f"Missing WT prediction for tx_index={tx_index}")
+                    raise ValueError(
+                        "Missing WT prediction for "
+                        f"tx_index={tx_index}, transcript_id={tx['transcript_id']}, "
+                        f"utr5_size={tx['utr5_size']}, cds_size={tx['cds_size']}, "
+                        f"tx_length={len(sequence)}. Score file: {args.scores}. "
+                        "This usually means the prediction step filtered or did not "
+                        "finish this transcript's WT variant."
+                    )
                 wt = float(effects[tx_index]["wt"])
 
                 position_summaries: dict[int, dict] = {}
