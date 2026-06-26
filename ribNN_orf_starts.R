@@ -51,6 +51,16 @@ codon_pos_labels <- c("1 (A)", "2 (T/U)", "3 (G)")
 # Load data
 # ============================================================
 
+# Paste a run output folder here if you want the script to ignore the defaults.
+# Use the run folder that contains summaries/, not final/ and not a .tsv.gz file.
+INPUT_RESULTS_DIR <- "/nemo/lab/ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/mouse_whole_atg_deletions_mean_predicted_TE"
+INPUT_RESULTS_DIR <- ""
+# Example:
+# INPUT_RESULTS_DIR <- "/nemo/lab/ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/mouse_whole_atg_deletions_mean_predicted_TE"
+
+# Usually leave this blank. Set only if you want a non-default master table.
+INPUT_MASTER_TABLE <- ""
+
 default_shared_root <- if (dir.exists("/camp/lab/ulej/home/shared/oscar_ira_riboloco")) {
   "/camp/lab/ulej/home/shared/oscar_ira_riboloco"
 } else {
@@ -66,16 +76,53 @@ output_root.dir <- Sys.getenv(
   file.path(shared_root, "RiboNN_ISM", "all_utr5_mutagenesis", "output")
 )
 
-species <- Sys.getenv("RIBONN_ORF_SPECIES", "human")
+input_results_dir <- trimws(INPUT_RESULTS_DIR)
+input_master_table <- trimws(INPUT_MASTER_TABLE)
+
+infer_species_from_path <- function(path) {
+  normalized_path <- normalizePath(path, mustWork = FALSE)
+  folder <- basename(normalized_path)
+  if (folder %in% c("summaries", "final")) {
+    folder <- basename(dirname(normalized_path))
+  }
+  if (str_detect(folder, "^mouse_")) {
+    return("mouse")
+  }
+  if (str_detect(folder, "^human_")) {
+    return("human")
+  }
+  Sys.getenv("RIBONN_ORF_SPECIES", "human")
+}
+
+species <- if (nzchar(input_results_dir)) {
+  infer_species_from_path(input_results_dir)
+} else {
+  Sys.getenv("RIBONN_ORF_SPECIES", "human")
+}
 if (!species %in% c("human", "mouse")) {
-  stop("RIBONN_ORF_SPECIES must be 'human' or 'mouse'")
+  stop("Species must be 'human' or 'mouse'. Set RIBONN_ORF_SPECIES if the path is ambiguous.")
 }
 default_te_label <- if (species == "mouse") "mean_predicted_TE" else "normal_brain_tissue"
 te_label <- Sys.getenv("RIBONN_ORF_TE_LABEL", default_te_label)
+orf_screen <- Sys.getenv("RIBONN_ORF_SCREEN", "orf_starts")
+if (orf_screen %in% c("whole-atg-deletion", "whole_atg_deletions")) {
+  orf_screen <- "whole_atg_deletion"
+}
+if (!orf_screen %in% c("orf_starts", "whole_atg_deletion")) {
+  stop("RIBONN_ORF_SCREEN must be 'orf_starts' or 'whole_atg_deletion'")
+}
+default_results_name <- if (orf_screen == "whole_atg_deletion") {
+  paste0(species, "_whole_atg_deletions_", te_label)
+} else {
+  paste0(species, "_orf_starts_", te_label)
+}
 ism_results.dir <- Sys.getenv(
   "RIBONN_ORF_RESULTS_DIR",
-  file.path(output_root.dir, paste0(species, "_orf_starts_", te_label))
+  file.path(output_root.dir, default_results_name)
 )
+if (nzchar(input_results_dir)) {
+  ism_results.dir <- input_results_dir
+}
 ism_summary.dir <- if (dir.exists(file.path(ism_results.dir, "summaries"))) {
   file.path(ism_results.dir, "summaries")
 } else {
@@ -92,7 +139,11 @@ default_master_tables <- c(
     "cross_tissue.unmixing.master_table.with_below_tpm_threshold.tsv.gz"
   )
 )
-master_table <- Sys.getenv("RIBONN_ORF_MASTER_TABLE", default_master_tables[[species]])
+master_table <- if (nzchar(input_master_table)) {
+  input_master_table
+} else {
+  Sys.getenv("RIBONN_ORF_MASTER_TABLE", default_master_tables[[species]])
+}
 
 cat("Species:", species, "\n")
 cat("ISM summaries:", ism_summary.dir, "\n")
@@ -109,6 +160,9 @@ if (length(pos.ls) == 0) {
   stop("No shard position summaries found in ", ism_summary.dir)
 }
 pos.df <- rbindlist(lapply(pos.ls, fread))
+
+whole_atg_mode <- "whole_atg_deletion_te_change" %in% names(ism.df)
+cat("Screen mode:", if_else(whole_atg_mode, "whole_atg_deletion", "orf_start_codon"), "\n")
 
 master.df <- fread(master_table)
 required_master_cols <- c("transcript_id", "orf_id", "orf_label", "tpm_threshold_group", "orf_rel_to_cds")
@@ -169,19 +223,182 @@ cat("ORF-level rows after joining master table:", nrow(ism.df), "\n")
 # Prepare position-level table
 # ============================================================
 
-# In orf_start_codon mode every row is one of the 3 ATG positions
 pos.df <- pos.df %>%
   tidyr::unite("orf_id", transcript_id, orf_start_1based, orf_stop_1based, orf_frame,
                sep = "_", remove = FALSE) %>%
   left_join(master_orf_def.df, by = "orf_id") %>%
   filter(!is.na(orf_definition)) %>%
-  mutate(
-    orf_definition   = factor(orf_definition, levels = orf_definition_levels),
-    pos_label        = factor(codon_pos_labels[orf_position_in_start_codon],
-                              levels = codon_pos_labels)
-  )
+  mutate(orf_definition = factor(orf_definition, levels = orf_definition_levels))
+
+if (!whole_atg_mode) {
+  # In orf_start_codon mode every row is one of the 3 ATG positions
+  pos.df <- pos.df %>%
+    mutate(
+      pos_label = factor(codon_pos_labels[orf_position_in_start_codon],
+                         levels = codon_pos_labels)
+    )
+}
 
 cat("Position-level rows after joining master table:", nrow(pos.df), "\n")
+
+if (whole_atg_mode) {
+
+
+# ============================================================
+# Whole-ATG deletion mode
+# ============================================================
+
+suppressPackageStartupMessages(library(cowplot))
+
+SHOW_LOW_EXPR <- FALSE
+
+PUB_SUB_LEVELS <- if (SHOW_LOW_EXPR) orf_definition_sub_levels else
+  grep("low expr", orf_definition_sub_levels, value = TRUE, invert = TRUE)
+
+PUB_SUB_COLORS <- orf_definition_sub_colors[PUB_SUB_LEVELS]
+
+FACET_GROUP <- c(
+  "uORF"                         = "uORF",
+  "uoORF"                        = "uoORF",
+  "Not det. (filt.) · uORF"     = "uORF",
+  "Not det. (filt.) · uoORF"    = "uoORF",
+  "Not det. (low expr.) · uORF"  = "uORF",
+  "Not det. (low expr.) · uoORF" = "uoORF"
+)
+
+add_facet_group <- function(df) {
+  df %>%
+    mutate(facet_group = factor(
+      FACET_GROUP[as.character(orf_definition_sub)],
+      levels = c("uORF", "uoORF")
+    ))
+}
+
+add_dist_bin <- function(df, offset_col) {
+  df %>% mutate(
+    distance_bin = factor(
+      case_when(
+        .data[[offset_col]] >= -30  ~ "≤30 nt",
+        .data[[offset_col]] >= -60  ~ "30–60 nt",
+        .data[[offset_col]] >= -120 ~ "60–120 nt",
+        TRUE                         ~ ">120 nt"
+      ),
+      levels = c("≤30 nt", "30–60 nt", "60–120 nt", ">120 nt")
+    )
+  )
+}
+
+pub_base_theme <- theme_classic(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    legend.key.size  = unit(4, "mm"),
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 8),
+    axis.title       = element_text(size = 10),
+    axis.text        = element_text(size = 9),
+    plot.title       = element_text(size = 11, face = "bold"),
+    plot.subtitle    = element_text(size = 8,  colour = "grey40"),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 9, face = "bold")
+  )
+
+pub_box_theme <- pub_base_theme +
+  theme(
+    axis.text.x        = element_text(angle = 30, hjust = 1, size = 8),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3)
+  )
+
+orf_start_dist.df <- pos.df %>%
+  mutate(
+    orf_start_1based_num = as.numeric(orf_start_1based),
+    orf_stop_1based_num  = as.numeric(orf_stop_1based),
+    orf_length_nt = abs(orf_stop_1based_num - orf_start_1based_num) + 1
+  ) %>%
+  dplyr::select(orf_id, orf_start_offset = offset_from_cds_start, orf_length_nt)
+
+ism_whole.df <- ism.df %>%
+  left_join(master_orf_def_sub.df, by = "orf_id") %>%
+  filter(!is.na(orf_definition_sub)) %>%
+  { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
+  mutate(
+    orf_definition_sub = factor(orf_definition_sub, levels = PUB_SUB_LEVELS),
+    detected_group     = factor(
+      if_else(orf_definition_sub %in% c("uORF", "uoORF"), "Detected", "Not detected"),
+      levels = c("Detected", "Not detected")
+    ),
+    whole_atg_delta = as.numeric(whole_atg_deletion_te_change)
+  ) %>%
+  add_facet_group() %>%
+  left_join(orf_start_dist.df, by = "orf_id") %>%
+  add_dist_bin("orf_start_offset") %>%
+  filter(is.finite(whole_atg_delta))
+
+whole_atg_deletion_box.gg <- ism_whole.df %>%
+  ggplot(aes(x = detected_group, y = whole_atg_delta,
+             fill = orf_definition_sub, colour = orf_definition_sub)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5,
+               colour = "grey30", linewidth = 0.35) +
+  geom_jitter(width = 0.14, alpha = 0.35, size = 0.7, stroke = 0,
+              show.legend = FALSE) +
+  facet_wrap(~facet_group, ncol = 2) +
+  scale_fill_manual(values   = PUB_SUB_COLORS, name = "ORF class") +
+  scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class") +
+  labs(x = NULL, y = "ΔTE (whole ATG deletion)") +
+  pub_box_theme +
+  guides(fill = "none", colour = "none")
+
+whole_atg_deletion_dist_bins.gg <- ism_whole.df %>%
+  ggplot(aes(x = detected_group, y = whole_atg_delta,
+             fill = orf_definition_sub, colour = orf_definition_sub)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5,
+               colour = "grey30", linewidth = 0.35) +
+  geom_jitter(width = 0.12, alpha = 0.35, size = 0.55, stroke = 0,
+              show.legend = FALSE) +
+  stat_summary(
+    fun.data = function(x) data.frame(y = Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 1.5, size = 2.0, colour = "grey30", show.legend = FALSE
+  ) +
+  facet_grid(facet_group ~ distance_bin) +
+  scale_fill_manual(values = PUB_SUB_COLORS, name = "ORF class") +
+  scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class") +
+  labs(x = NULL, y = "ΔTE (whole ATG deletion)") +
+  pub_box_theme +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        legend.position = "top")
+
+smooth_regression_input.df <- ism_whole.df %>%
+  mutate(
+    delta_te = whole_atg_delta,
+    detected_status = if_else(detected_group == "Detected", 1, 0),
+    gene_re = factor(gene_id),
+    orf_length_nt = as.numeric(orf_length_nt),
+    orf_start_offset = as.numeric(orf_start_offset)
+  ) %>%
+  filter(
+    is.finite(delta_te),
+    is.finite(orf_start_offset),
+    is.finite(orf_length_nt),
+    !is.na(gene_re),
+    !is.na(facet_group)
+  )
+
+
+
+pub_whole_atg_deletion.gg <- cowplot::plot_grid(
+  whole_atg_deletion_box.gg,
+  whole_atg_deletion_dist_bins.gg,
+  ncol = 1,
+  rel_heights = c(1.0, 1.2),
+  align = "v",
+  axis = "l"
+)
+
+} else {
 
 
 # ============================================================
@@ -945,149 +1162,3 @@ pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
                                        ncol = 2, align = "hv")
 
 
-# ============================================================
-# Offset-adjusted detected-vs-undetected regression
-# ============================================================
-
-smooth_regression_input.df <- ism_sub.df %>%
-  orf_effect_long() %>%
-  mutate(
-    detected_status = if_else(detected_group == "Detected", 1, 0),
-    gene_re         = factor(gene_id),
-    orf_length_nt   = as.numeric(orf_length_nt),
-    orf_start_offset = as.numeric(orf_start_offset)
-  ) %>%
-  filter(
-    is.finite(delta_te),
-    is.finite(orf_start_offset),
-    is.finite(orf_length_nt),
-    !is.na(gene_re),
-    !is.na(facet_group),
-    !is.na(effect_type)
-  )
-
-empty_smooth_regression_row <- function(status, message = NA_character_) {
-  tibble(
-    status = status,
-    message = message,
-    n = NA_integer_,
-    n_detected = NA_integer_,
-    n_undetected = NA_integer_,
-    n_genes = NA_integer_,
-    n_unique_offsets = NA_integer_,
-    smooth_k = NA_integer_,
-    detected_estimate = NA_real_,
-    detected_se = NA_real_,
-    detected_ci_low = NA_real_,
-    detected_ci_high = NA_real_,
-    detected_p = NA_real_,
-    deviance_explained = NA_real_
-  )
-}
-
-fit_offset_smooth_regression <- function(df) {
-  n_detected <- sum(df$detected_status == 1)
-  n_undetected <- sum(df$detected_status == 0)
-  n_offsets <- n_distinct(df$orf_start_offset)
-  n_genes <- n_distinct(df$gene_re)
-
-  if (n_detected < 3 || n_undetected < 3 || n_offsets < 4) {
-    return(empty_smooth_regression_row(
-      "skipped",
-      "Need at least 3 detected, 3 undetected, and 4 unique offsets."
-    ) %>%
-      mutate(
-        n = nrow(df),
-        n_detected = n_detected,
-        n_undetected = n_undetected,
-        n_genes = n_genes,
-        n_unique_offsets = n_offsets
-      ))
-  }
-
-  smooth_k <- min(10L, max(4L, n_offsets - 1L))
-  fit <- tryCatch(
-    mgcv::gam(
-      delta_te ~ detected_status +
-        s(orf_start_offset, k = smooth_k) +
-        scale(orf_length_nt) +
-        s(gene_re, bs = "re"),
-      data = df,
-      method = "REML"
-    ),
-    error = function(err) err
-  )
-
-  if (inherits(fit, "error")) {
-    return(empty_smooth_regression_row("error", conditionMessage(fit)) %>%
-      mutate(
-        n = nrow(df),
-        n_detected = n_detected,
-        n_undetected = n_undetected,
-        n_genes = n_genes,
-        n_unique_offsets = n_offsets,
-        smooth_k = smooth_k
-      ))
-  }
-
-  param_table <- summary(fit)$p.table
-  if (!"detected_status" %in% rownames(param_table)) {
-    return(empty_smooth_regression_row(
-      "error",
-      "Detected coefficient was not estimable in this subgroup."
-    ) %>%
-      mutate(
-        n = nrow(df),
-        n_detected = n_detected,
-        n_undetected = n_undetected,
-        n_genes = n_genes,
-        n_unique_offsets = n_offsets,
-        smooth_k = smooth_k
-      ))
-  }
-  detected_row <- param_table["detected_status", , drop = FALSE]
-  estimate <- detected_row[1, "Estimate"]
-  se <- detected_row[1, "Std. Error"]
-
-  tibble(
-    status = "ok",
-    message = NA_character_,
-    n = nrow(df),
-    n_detected = n_detected,
-    n_undetected = n_undetected,
-    n_genes = n_genes,
-    n_unique_offsets = n_offsets,
-    smooth_k = smooth_k,
-    detected_estimate = estimate,
-    detected_se = se,
-    detected_ci_low = estimate - 1.96 * se,
-    detected_ci_high = estimate + 1.96 * se,
-    detected_p = detected_row[1, "Pr(>|t|)"],
-    deviance_explained = summary(fit)$dev.expl
-  )
-}
-
-smooth_regression_results.df <- smooth_regression_input.df %>%
-  group_by(facet_group, effect_type) %>%
-  group_modify(~fit_offset_smooth_regression(.x)) %>%
-  ungroup()
-
-smooth_regression_results.df
-
-smooth_regression_detected_coef.gg <- smooth_regression_results.df %>%
-  filter(status == "ok") %>%
-  ggplot(aes(x = effect_type, y = detected_estimate,
-             ymin = detected_ci_low, ymax = detected_ci_high,
-             colour = facet_group)) +
-  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
-             linewidth = 0.35) +
-  geom_pointrange(position = position_dodge(width = 0.45), linewidth = 0.45) +
-  scale_colour_manual(values = c(uORF = "#76baa6", uoORF = "#74669d"),
-                      name = "ORF class") +
-  labs(
-    x = NULL,
-    y = "Detected coefficient (ΔTE)",
-    title = "Offset-adjusted detected-vs-undetected contrast",
-    subtitle = "GAM: ΔTE ~ detected + s(offset) + ORF length + (1|gene)"
-  ) +
-  pub_base_theme
