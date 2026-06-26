@@ -567,3 +567,384 @@ meta_dist_sub_del.gg <- ggplot(meta_dist_sub_grid_del,
     title = "Mean deletion ΔTE vs ORF start distance\n(theoreticals sub-stratified by structure)"
   ) +
   meta_dist_sub_theme
+
+
+# ============================================================
+# Final publication plots
+# ============================================================
+
+suppressPackageStartupMessages(library(cowplot))
+
+SHOW_LOW_EXPR <- FALSE
+
+PUB_SUB_LEVELS <- if (SHOW_LOW_EXPR) orf_definition_sub_levels else
+  grep("low expr", orf_definition_sub_levels, value = TRUE, invert = TRUE)
+
+PUB_SUB_COLORS <- orf_definition_sub_colors[PUB_SUB_LEVELS]
+
+DIST_CROP <- -500
+BIN_WIDTH <- 50
+MIN_N_BIN <- 15
+
+FACET_GROUP <- c(
+  "uORF"                         = "uORF",
+  "uoORF"                        = "uoORF",
+  "Not det. (filt.) · uORF"     = "uORF",
+  "Not det. (filt.) · uoORF"    = "uoORF",
+  "Not det. (low expr.) · uORF"  = "uORF",
+  "Not det. (low expr.) · uoORF" = "uoORF"
+)
+
+add_facet_group <- function(df) {
+  df %>%
+    mutate(facet_group = factor(
+      FACET_GROUP[as.character(orf_definition_sub)],
+      levels = c("uORF", "uoORF")
+    ))
+}
+
+pub_base_theme <- theme_classic(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    legend.key.size  = unit(4, "mm"),
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 8),
+    axis.title       = element_text(size = 10),
+    axis.text        = element_text(size = 9),
+    plot.title       = element_text(size = 11, face = "bold"),
+    plot.subtitle    = element_text(size = 8,  colour = "grey40"),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 9, face = "bold")
+  )
+
+
+prepare_hm_sub <- function(df) {
+  df %>%
+    filter(dist_bin >= DIST_CROP) %>%
+    { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
+    add_facet_group() %>%
+    mutate(orf_definition_sub = fct_rev(
+      factor(orf_definition_sub, levels = PUB_SUB_LEVELS)
+    ))
+}
+
+pub_fill_scale <- scale_fill_gradient2(
+  low = "#74669d", mid = "grey92", high = "#76baa6", midpoint = 0,
+  name = "Mean ΔTE",
+  guide = guide_colourbar(barheight = unit(22, "mm"), barwidth = unit(3, "mm"))
+)
+
+pub_hm_theme <- theme_classic(base_size = 11) +
+  theme(
+    axis.line        = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "grey70", linewidth = 0.5),
+    panel.spacing.y  = unit(6, "pt"),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y      = element_text(size = 9),
+    axis.title       = element_text(size = 10),
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 8),
+    plot.title       = element_text(size = 11, face = "bold"),
+    strip.background = element_blank(),
+    strip.text.y     = element_text(size = 9, face = "bold", angle = 0, hjust = 0)
+  )
+
+hm_x_scale <- scale_x_continuous(
+  breaks = seq(DIST_CROP, 0, by = 100),
+  expand = expansion(add = c(12.5, 12.5))
+)
+
+pub_hm_sub.gg <- prepare_hm_sub(meta_dist_sub_grid_sub) %>%
+  ggplot(aes(x = dist_bin, y = orf_definition_sub, fill = mean_change)) +
+  geom_tile(height = 0.85, colour = "white", linewidth = 0.25) +
+  facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+  hm_x_scale +
+  scale_y_discrete(expand = expansion(add = 0.4)) +
+  labs(x = NULL, y = NULL, title = "Substitution  —  mean ΔTE") +
+  pub_fill_scale + pub_hm_theme
+
+pub_hm_del.gg <- prepare_hm_sub(meta_dist_sub_grid_del) %>%
+  ggplot(aes(x = dist_bin, y = orf_definition_sub, fill = mean_change)) +
+  geom_tile(height = 0.85, colour = "white", linewidth = 0.25) +
+  facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+  hm_x_scale +
+  scale_y_discrete(expand = expansion(add = 0.4)) +
+  labs(x = "ORF start offset from CDS (nt)", y = NULL,
+       title = "Deletion  —  mean ΔTE") +
+  pub_fill_scale + pub_hm_theme
+heatmap.gg <- cowplot::plot_grid(pub_hm_sub.gg, pub_hm_del.gg, ncol = 1, align = "v")
+
+bin_summary_sub <- function(df, value_col) {
+  df %>%
+    filter(offset_from_cds_start >= DIST_CROP) %>%
+    { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
+    add_facet_group() %>%
+    mutate(
+      orf_definition_sub = factor(orf_definition_sub, levels = PUB_SUB_LEVELS),
+      dist_bin = floor(offset_from_cds_start / BIN_WIDTH) * BIN_WIDTH + BIN_WIDTH / 2
+    ) %>%
+    group_by(facet_group, orf_definition_sub, dist_bin) %>%
+    summarise(
+      mean_val = mean(.data[[value_col]], na.rm = TRUE),
+      se_val   = sd(.data[[value_col]], na.rm = TRUE) / sqrt(n()),
+      n        = n(),
+      .groups  = "drop"
+    ) %>%
+    filter(n >= MIN_N_BIN)
+}
+
+sub_line_sub.df <- bin_summary_sub(orf_dist_sub.df, "substitution_te_change_mean")
+del_line_sub.df <- bin_summary_sub(orf_dist_sub.df, "deletion_te_change")
+
+pub_line_layers <- list(
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35),
+  geom_ribbon(aes(ymin = mean_val - 1.96 * se_val,
+                  ymax = mean_val + 1.96 * se_val,
+                  fill = orf_definition_sub),
+              alpha = 0.15, colour = NA),
+  geom_line(aes(colour = orf_definition_sub), linewidth = 0.75),
+  facet_wrap(~facet_group, ncol = 2),
+  scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class"),
+  scale_fill_manual(values   = PUB_SUB_COLORS, name = "ORF class"),
+  scale_x_continuous(
+    breaks = seq(DIST_CROP, 0, by = 100),
+    expand = expansion(mult = c(0.01, 0.02))
+  ),
+  coord_cartesian(xlim = c(DIST_CROP, 0)),
+  pub_base_theme
+)
+
+pub_line_sub.gg <- ggplot(sub_line_sub.df, aes(x = dist_bin, y = mean_val)) +
+  pub_line_layers +
+  labs(x = NULL, y = "Mean substitution ΔTE", title = "Substitution")
+
+pub_line_del.gg <- ggplot(del_line_sub.df, aes(x = dist_bin, y = mean_val)) +
+  pub_line_layers +
+  labs(x = "ORF start offset from CDS (nt)", y = "Mean deletion ΔTE",
+       title = "Deletion")
+
+pub_line.gg <- cowplot::plot_grid(pub_line_sub.gg, pub_line_del.gg, ncol = 1, align = "v")
+
+
+# ============================================================
+# ATG codon sensitivity summary plots
+# ============================================================
+
+ism_sub.df <- ism.df %>%
+  left_join(master_orf_def_sub.df, by = "orf_id") %>%
+  filter(!is.na(orf_definition_sub)) %>%
+  { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
+  mutate(
+    orf_definition_sub = factor(orf_definition_sub, levels = PUB_SUB_LEVELS),
+    detected_group     = factor(
+      if_else(orf_definition_sub %in% c("uORF", "uoORF"), "Detected", "Not detected"),
+      levels = c("Detected", "Not detected")
+    )
+  ) %>%
+  add_facet_group()
+
+orf_start_dist.df <- pos.df %>%
+  filter(orf_position_in_start_codon == 1) %>%
+  dplyr::select(orf_id, orf_start_offset = offset_from_cds_start)
+
+add_dist_bin <- function(df, offset_col) {
+  df %>% mutate(
+    distance_bin = factor(
+      case_when(
+        .data[[offset_col]] >= -30  ~ "≤30 nt",
+        .data[[offset_col]] >= -60  ~ "30–60 nt",
+        .data[[offset_col]] >= -120 ~ "60–120 nt",
+        TRUE                         ~ ">120 nt"
+      ),
+      levels = c("≤30 nt", "30–60 nt", "60–120 nt", ">120 nt")
+    )
+  )
+}
+
+ism_sub.df <- ism_sub.df %>%
+  left_join(orf_start_dist.df, by = "orf_id") %>%
+  add_dist_bin("orf_start_offset")
+
+pos_sub_aug.df <- pos_sub.df %>%
+  { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
+  mutate(
+    orf_definition_sub = factor(orf_definition_sub, levels = PUB_SUB_LEVELS),
+    detected_group     = factor(
+      if_else(orf_definition_sub %in% c("uORF", "uoORF"), "Detected", "Not detected"),
+      levels = c("Detected", "Not detected")
+    )
+  ) %>%
+  add_facet_group() %>%
+  left_join(orf_start_dist.df, by = "orf_id") %>%
+  add_dist_bin("orf_start_offset")
+
+pub_box_theme <- pub_base_theme +
+  theme(
+    axis.text.x        = element_text(angle = 30, hjust = 1, size = 8),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3)
+  )
+
+pos_hm_theme <- theme_classic(base_size = 10) +
+  theme(
+    axis.line        = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "grey70", linewidth = 0.4),
+    panel.spacing    = unit(4, "pt"),
+    axis.text        = element_text(size = 8),
+    axis.text.x      = element_text(angle = 30, hjust = 1),
+    axis.title       = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 8, face = "bold"),
+    legend.title     = element_text(size = 8),
+    legend.text      = element_text(size = 7)
+  )
+
+codon_hm_fill <- scale_fill_gradient2(
+  low = "#74669d", mid = "grey92", high = "#76baa6", midpoint = 0,
+  name = "Mean ΔTE",
+  guide = guide_colourbar(barheight = unit(16, "mm"), barwidth = unit(3, "mm"))
+)
+
+codon_pos_long_summary <- function(df, group_cols) {
+  df %>%
+    group_by(across(all_of(c(group_cols, "pos_label")))) %>%
+    summarise(
+      mean_sub = mean(substitution_te_change_mean, na.rm = TRUE),
+      mean_del = mean(deletion_te_change,          na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    pivot_longer(cols = c(mean_sub, mean_del),
+                 names_to = "metric", values_to = "mean_val") %>%
+    mutate(metric = recode(metric,
+                           mean_sub = "Substitution",
+                           mean_del = "Deletion"))
+}
+
+orf_effect_long <- function(df) {
+  df %>%
+    pivot_longer(
+      cols = c(orf_substitution_te_change_mean_3nt,
+               orf_deletion_te_change_mean_3nt),
+      names_to = "effect_type",
+      values_to = "delta_te"
+    ) %>%
+    mutate(
+      effect_type = recode(
+        effect_type,
+        orf_substitution_te_change_mean_3nt = "Substitution",
+        orf_deletion_te_change_mean_3nt = "Deletion"
+      )
+    )
+}
+
+
+n_a.df <- count(ism_sub.df, facet_group, detected_group, orf_definition_sub,
+                name = "n_orfs")
+
+box_a.gg <- ism_sub.df %>%
+  orf_effect_long() %>%
+  ggplot(aes(x = detected_group, y = delta_te,
+             fill = orf_definition_sub, colour = orf_definition_sub)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5,
+               colour = "grey30", linewidth = 0.35) +
+  geom_jitter(width = 0.14, alpha = 0.35, size = 0.7, stroke = 0,
+              show.legend = FALSE) +
+  geom_text(data = n_a.df,
+            aes(x = detected_group, y = Inf, label = paste0("n=", n_orfs)),
+            inherit.aes = FALSE, vjust = 1.5, size = 2.3, colour = "grey30") +
+  facet_grid(effect_type ~ facet_group) +
+  scale_fill_manual(values   = PUB_SUB_COLORS, name = "ORF class") +
+  scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class") +
+  labs(x = NULL, y = "ΔTE (ATG codon avg)") +
+  pub_box_theme + guides(fill = "none", colour = "none")
+
+hm_a.gg <- codon_pos_long_summary(pos_sub_aug.df,
+                                   c("facet_group", "detected_group")) %>%
+  ggplot(aes(x = metric, y = fct_rev(pos_label), fill = mean_val)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.3f", mean_val)), size = 2.3) +
+  facet_grid(detected_group ~ facet_group) +
+  codon_hm_fill +
+  scale_x_discrete(expand = expansion(add = 0)) +
+  scale_y_discrete(expand = expansion(add = 0.3)) +
+  labs(x = NULL, y = "Codon\nposition") +
+  pos_hm_theme
+
+pub_orf_class.gg <- cowplot::plot_grid(box_a.gg, hm_a.gg, ncol = 1,
+                                       rel_heights = c(3.0, 1.5), align = "v")
+
+make_distance_bin_plot <- function(structural_type, heatmap_low, heatmap_high) {
+  structural_levels <- PUB_SUB_LEVELS[
+    FACET_GROUP[PUB_SUB_LEVELS] == structural_type
+  ]
+  structural_colors <- PUB_SUB_COLORS[structural_levels]
+  box_df <- ism_sub.df %>%
+    filter(facet_group == structural_type, !is.na(distance_bin)) %>%
+    mutate(orf_definition_sub = fct_drop(orf_definition_sub))
+  hm_df <- pos_sub_aug.df %>%
+    filter(facet_group == structural_type, !is.na(distance_bin)) %>%
+    mutate(orf_definition_sub = fct_drop(orf_definition_sub))
+
+  box_plot <- box_df %>%
+    orf_effect_long() %>%
+    ggplot(aes(x = detected_group, y = delta_te,
+               fill = orf_definition_sub, colour = orf_definition_sub)) +
+    geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+               linewidth = 0.35) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5,
+                 colour = "grey30", linewidth = 0.35) +
+    geom_jitter(width = 0.12, alpha = 0.35, size = 0.55, stroke = 0,
+                show.legend = FALSE) +
+    stat_summary(
+      fun.data = function(x) data.frame(y = Inf, label = paste0("n=", length(x))),
+      geom = "text",
+      vjust = 1.5, size = 2.0, colour = "grey30", show.legend = FALSE
+    ) +
+    facet_grid(effect_type ~ distance_bin) +
+    scale_fill_manual(values = structural_colors, name = structural_type) +
+    scale_colour_manual(values = structural_colors, name = structural_type) +
+    labs(x = NULL, y = "ΔTE (ATG codon avg)",
+         title = structural_type) +
+    pub_box_theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          legend.position = "top")
+
+  heatmap_fill <- scale_fill_gradient2(
+    low = heatmap_low, mid = "grey92", high = heatmap_high, midpoint = 0,
+    name = "Mean ΔTE",
+    guide = guide_colourbar(barheight = unit(14, "mm"), barwidth = unit(3, "mm"))
+  )
+
+  heatmap_plot <- codon_pos_long_summary(
+      hm_df,
+      c("distance_bin", "detected_group")
+    ) %>%
+    ggplot(aes(x = metric, y = fct_rev(pos_label), fill = mean_val)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.3f", mean_val)), size = 2.2) +
+    facet_grid(distance_bin ~ detected_group) +
+    heatmap_fill +
+    scale_x_discrete(expand = expansion(add = 0)) +
+    scale_y_discrete(expand = expansion(add = 0.3)) +
+    labs(x = NULL, y = "Codon\nposition") +
+    pos_hm_theme
+
+  cowplot::plot_grid(box_plot, heatmap_plot, ncol = 1,
+                     rel_heights = c(3.0, 1.6), align = "v")
+}
+
+pub_dist_bins_uorf.gg <- make_distance_bin_plot(
+  "uORF",
+  heatmap_low = "#dceee9",
+  heatmap_high = "#76baa6"
+)
+pub_dist_bins_uo_orf.gg <- make_distance_bin_plot(
+  "uoORF",
+  heatmap_low = "#e4e0ef",
+  heatmap_high = "#74669d"
+)
+pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
+                                       pub_dist_bins_uo_orf.gg,
+                                       ncol = 2, align = "hv")
