@@ -2,6 +2,7 @@
 
 suppressPackageStartupMessages(library(tidyverse))
 suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(mgcv))
 
 orf_definition_colors <- c(
   "Not detected (expression-filtered)" = "#6B6B6B",
@@ -746,7 +747,12 @@ ism_sub.df <- ism.df %>%
 
 orf_start_dist.df <- pos.df %>%
   filter(orf_position_in_start_codon == 1) %>%
-  dplyr::select(orf_id, orf_start_offset = offset_from_cds_start)
+  mutate(
+    orf_start_1based_num = as.numeric(orf_start_1based),
+    orf_stop_1based_num  = as.numeric(orf_stop_1based),
+    orf_length_nt = abs(orf_stop_1based_num - orf_start_1based_num) + 1
+  ) %>%
+  dplyr::select(orf_id, orf_start_offset = offset_from_cds_start, orf_length_nt)
 
 add_dist_bin <- function(df, offset_col) {
   df %>% mutate(
@@ -1006,3 +1012,151 @@ pub_dist_bins_uo_orf.gg <- make_distance_bin_plot(
 pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
                                        pub_dist_bins_uo_orf.gg,
                                        ncol = 2, align = "hv")
+
+
+# ============================================================
+# Offset-adjusted detected-vs-undetected regression
+# ============================================================
+
+smooth_regression_input.df <- ism_sub.df %>%
+  orf_effect_long() %>%
+  mutate(
+    detected_status = if_else(detected_group == "Detected", 1, 0),
+    gene_re         = factor(gene_id),
+    orf_length_nt   = as.numeric(orf_length_nt),
+    orf_start_offset = as.numeric(orf_start_offset)
+  ) %>%
+  filter(
+    is.finite(delta_te),
+    is.finite(orf_start_offset),
+    is.finite(orf_length_nt),
+    !is.na(gene_re),
+    !is.na(facet_group),
+    !is.na(effect_type)
+  )
+
+empty_smooth_regression_row <- function(status, message = NA_character_) {
+  tibble(
+    status = status,
+    message = message,
+    n = NA_integer_,
+    n_detected = NA_integer_,
+    n_undetected = NA_integer_,
+    n_genes = NA_integer_,
+    n_unique_offsets = NA_integer_,
+    smooth_k = NA_integer_,
+    detected_estimate = NA_real_,
+    detected_se = NA_real_,
+    detected_ci_low = NA_real_,
+    detected_ci_high = NA_real_,
+    detected_p = NA_real_,
+    deviance_explained = NA_real_
+  )
+}
+
+fit_offset_smooth_regression <- function(df) {
+  n_detected <- sum(df$detected_status == 1)
+  n_undetected <- sum(df$detected_status == 0)
+  n_offsets <- n_distinct(df$orf_start_offset)
+  n_genes <- n_distinct(df$gene_re)
+
+  if (n_detected < 3 || n_undetected < 3 || n_offsets < 4) {
+    return(empty_smooth_regression_row(
+      "skipped",
+      "Need at least 3 detected, 3 undetected, and 4 unique offsets."
+    ) %>%
+      mutate(
+        n = nrow(df),
+        n_detected = n_detected,
+        n_undetected = n_undetected,
+        n_genes = n_genes,
+        n_unique_offsets = n_offsets
+      ))
+  }
+
+  smooth_k <- min(10L, max(4L, n_offsets - 1L))
+  fit <- tryCatch(
+    mgcv::gam(
+      delta_te ~ detected_status +
+        s(orf_start_offset, k = smooth_k) +
+        scale(orf_length_nt) +
+        s(gene_re, bs = "re"),
+      data = df,
+      method = "REML"
+    ),
+    error = function(err) err
+  )
+
+  if (inherits(fit, "error")) {
+    return(empty_smooth_regression_row("error", conditionMessage(fit)) %>%
+      mutate(
+        n = nrow(df),
+        n_detected = n_detected,
+        n_undetected = n_undetected,
+        n_genes = n_genes,
+        n_unique_offsets = n_offsets,
+        smooth_k = smooth_k
+      ))
+  }
+
+  param_table <- summary(fit)$p.table
+  if (!"detected_status" %in% rownames(param_table)) {
+    return(empty_smooth_regression_row(
+      "error",
+      "Detected coefficient was not estimable in this subgroup."
+    ) %>%
+      mutate(
+        n = nrow(df),
+        n_detected = n_detected,
+        n_undetected = n_undetected,
+        n_genes = n_genes,
+        n_unique_offsets = n_offsets,
+        smooth_k = smooth_k
+      ))
+  }
+  detected_row <- param_table["detected_status", , drop = FALSE]
+  estimate <- detected_row[1, "Estimate"]
+  se <- detected_row[1, "Std. Error"]
+
+  tibble(
+    status = "ok",
+    message = NA_character_,
+    n = nrow(df),
+    n_detected = n_detected,
+    n_undetected = n_undetected,
+    n_genes = n_genes,
+    n_unique_offsets = n_offsets,
+    smooth_k = smooth_k,
+    detected_estimate = estimate,
+    detected_se = se,
+    detected_ci_low = estimate - 1.96 * se,
+    detected_ci_high = estimate + 1.96 * se,
+    detected_p = detected_row[1, "Pr(>|t|)"],
+    deviance_explained = summary(fit)$dev.expl
+  )
+}
+
+smooth_regression_results.df <- smooth_regression_input.df %>%
+  group_by(facet_group, effect_type) %>%
+  group_modify(~fit_offset_smooth_regression(.x)) %>%
+  ungroup()
+
+smooth_regression_results.df
+
+smooth_regression_detected_coef.gg <- smooth_regression_results.df %>%
+  filter(status == "ok") %>%
+  ggplot(aes(x = effect_type, y = detected_estimate,
+             ymin = detected_ci_low, ymax = detected_ci_high,
+             colour = facet_group)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(width = 0.45), linewidth = 0.45) +
+  scale_colour_manual(values = c(uORF = "#76baa6", uoORF = "#74669d"),
+                      name = "ORF class") +
+  labs(
+    x = NULL,
+    y = "Detected coefficient (ΔTE)",
+    title = "Offset-adjusted detected-vs-undetected contrast",
+    subtitle = "GAM: ΔTE ~ detected + s(offset) + ORF length + (1|gene)"
+  ) +
+  pub_base_theme
