@@ -273,14 +273,43 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
     exit 0
 fi
 
-mkdir -p "${REPO_ROOT}/logs" "${OUTDIR}"
+slurm_job_id() {
+    # sbatch --parsable may return jobid;cluster on federated systems.
+    # Dependencies and local log filenames should use the numeric job ID.
+    echo "${1%%;*}"
+}
+
+LOG_DIR="${REPO_ROOT}/logs"
+mkdir -p "${LOG_DIR}" "${OUTDIR}"
 PREP_ARGS_FILE="${OUTDIR}/prepare_source_args.txt"
+SUBMISSION_MANIFEST="${OUTDIR}/submission_manifest.tsv"
+DEBUG_COMMANDS="${OUTDIR}/slurm_debug_commands.txt"
 printf '%s\n' "${PREP_SOURCE_ARGS[@]}" > "${PREP_ARGS_FILE}"
 
-PREP_JOB=$(sbatch --parsable \
+cat > "${SUBMISSION_MANIFEST}" << EOF
+key	value
+repo_root	${REPO_ROOT}
+species	${SPECIES}
+source	${SOURCE_LABEL}
+gtf	${GTF}
+screen	${SCREEN_LABEL}
+run_label	${RUN_LABEL}
+outdir	${OUTDIR}
+num_shards	${NUM_SHARDS}
+max_concurrent	${MAX_CONCURRENT}
+gpu_partition	${GPU_PARTITION}
+gpu_time	${GPU_TIME}
+gpu_mem	${GPU_MEM}
+batch_size	${BATCH_SIZE}
+top_k	${TOP_K}
+te_score	${TE_DISPLAY}
+keep_intermediates	${KEEP_INTERMEDIATES}
+EOF
+
+PREP_JOB_RAW=$(sbatch --parsable \
     --job-name="utr5all_1prep" \
-    --output="${REPO_ROOT}/logs/utr5all_1_prepare_%j.out" \
-    --error="${REPO_ROOT}/logs/utr5all_1_prepare_%j.err" \
+    --output="${LOG_DIR}/utr5all_1_prepare_%j.out" \
+    --error="${LOG_DIR}/utr5all_1_prepare_%j.err" \
     --partition=ncpu \
     --cpus-per-task=4 \
     --mem=32G \
@@ -289,10 +318,17 @@ PREP_JOB=$(sbatch --parsable \
     << EOF
 #!/bin/bash
 set -eo pipefail
+trap 'status=\$?; echo "[ERROR] \${SLURM_JOB_NAME:-prep} failed at line \${LINENO} with exit \${status}" >&2; exit \${status}' ERR
+echo "[INFO] Started \$(date -Is)"
+echo "[INFO] Host: \$(hostname)"
+echo "[INFO] PWD : \$(pwd)"
+echo "[INFO] Job : \${SLURM_JOB_ID:-unknown}"
+
 source \$(conda info --base)/etc/profile.d/conda.sh
 conda activate ribonn
 export LD_LIBRARY_PATH="\${CONDA_PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
 export PYTHONWARNINGS="\${PYTHONWARNINGS:+\${PYTHONWARNINGS},}ignore:pkg_resources is deprecated as an API:UserWarning"
+echo "[INFO] Python: \$(command -v python)"
 
 mkdir -p "${OUTDIR}" "${OUTDIR}/work" "${OUTDIR}/summaries" "${OUTDIR}/final"
 SOURCE_ARGS=()
@@ -307,15 +343,74 @@ python all_utr5_mutagenesis/prepare_catalog.py \
     "\${SOURCE_ARGS[@]}"
 
 python run_ribonn_predict.py --species "${SPECIES}" --download-only
+touch "${OUTDIR}/prepare_complete"
+echo "[INFO] Finished \$(date -Is)"
 EOF
 )
-echo "Preparation job: ${PREP_JOB}"
+PREP_JOB="$(slurm_job_id "${PREP_JOB_RAW}")"
+echo "Preparation job: ${PREP_JOB_RAW}"
+
+PREP_STATUS_JOB_RAW=$(sbatch --parsable \
+    --job-name="utr5all_1prep_status" \
+    --output="${LOG_DIR}/utr5all_1_prepare_status_%j.out" \
+    --error="${LOG_DIR}/utr5all_1_prepare_status_%j.err" \
+    --partition=ncpu \
+    --cpus-per-task=1 \
+    --mem=1G \
+    --time=00:10:00 \
+    --dependency="afterany:${PREP_JOB}" \
+    --chdir="${REPO_ROOT}" \
+    << EOF
+#!/bin/bash
+set -eo pipefail
+REPORT="${OUTDIR}/slurm_prepare_status_${PREP_JOB}.txt"
+{
+    echo "Preparation job status report"
+    echo "generated_at: \$(date -Is)"
+    echo "prep_job: ${PREP_JOB_RAW}"
+    echo "outdir: ${OUTDIR}"
+    echo
+    echo "sacct:"
+    if command -v sacct >/dev/null 2>&1; then
+        sacct -j "${PREP_JOB}" --format=JobID,JobName%24,State,ExitCode,Elapsed,Reason%40 || true
+    else
+        echo "sacct not available on this node"
+    fi
+    echo
+    if [[ -f "${OUTDIR}/prepare_complete" ]]; then
+        echo "prepare_complete marker: present"
+    else
+        echo "prepare_complete marker: missing"
+    fi
+    if [[ -f "${OUTDIR}/workflow_manifest.json" ]]; then
+        echo "workflow_manifest.json: present"
+    else
+        echo "workflow_manifest.json: missing"
+    fi
+    echo
+    for log in "${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.out" "${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.err"; do
+        echo "===== \${log} ====="
+        if [[ -s "\${log}" ]]; then
+            tail -n 200 "\${log}"
+        elif [[ -f "\${log}" ]]; then
+            echo "present but empty"
+        else
+            echo "missing"
+        fi
+        echo
+    done
+} > "\${REPORT}" 2>&1
+echo "Preparation status report: \${REPORT}"
+EOF
+)
+PREP_STATUS_JOB="$(slurm_job_id "${PREP_STATUS_JOB_RAW}")"
+echo "Prep status job: ${PREP_STATUS_JOB_RAW} [afterany:${PREP_JOB}]"
 
 ARRAY_MAX=$((NUM_SHARDS - 1))
-ARRAY_JOB=$(sbatch --parsable \
+ARRAY_JOB_RAW=$(sbatch --parsable \
     --job-name="utr5all_2pred" \
-    --output="${REPO_ROOT}/logs/utr5all_2_predict_%A_%a.out" \
-    --error="${REPO_ROOT}/logs/utr5all_2_predict_%A_%a.err" \
+    --output="${LOG_DIR}/utr5all_2_predict_%A_%a.out" \
+    --error="${LOG_DIR}/utr5all_2_predict_%A_%a.err" \
     --partition="${GPU_PARTITION}" \
     --gres=gpu:1 \
     --cpus-per-task=4 \
@@ -327,12 +422,19 @@ ARRAY_JOB=$(sbatch --parsable \
     << EOF
 #!/bin/bash
 set -eo pipefail
+trap 'status=\$?; echo "[ERROR] \${SLURM_JOB_NAME:-predict} task \${SLURM_ARRAY_TASK_ID:-NA} failed at line \${LINENO} with exit \${status}" >&2; exit \${status}' ERR
+echo "[INFO] Started \$(date -Is)"
+echo "[INFO] Host: \$(hostname)"
+echo "[INFO] PWD : \$(pwd)"
+echo "[INFO] Job : \${SLURM_ARRAY_JOB_ID:-\${SLURM_JOB_ID:-unknown}} task \${SLURM_ARRAY_TASK_ID:-NA}"
+
 module load CUDA/12.1.1 2>/dev/null || true
 source \$(conda info --base)/etc/profile.d/conda.sh
 conda activate ribonn
 export LD_LIBRARY_PATH="\${CONDA_PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
 unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONWARNINGS="\${PYTHONWARNINGS:+\${PYTHONWARNINGS},}ignore:pkg_resources is deprecated as an API:UserWarning"
+echo "[INFO] Python: \$(command -v python)"
 
 SHARD_ID=\$(printf '%03d' "\${SLURM_ARRAY_TASK_ID}")
 SHARD_CATALOG="${OUTDIR}/catalog/shards/shard_\${SHARD_ID}.transcripts.tsv.gz"
@@ -384,14 +486,16 @@ touch "\${DONE_FILE}"
 if [[ "${KEEP_INTERMEDIATES}" -eq 0 ]]; then
     rm -f "\${SHARD_INPUT}" "\${SHARD_SCORES}"
 fi
+echo "[INFO] Finished \$(date -Is)"
 EOF
 )
+ARRAY_JOB="$(slurm_job_id "${ARRAY_JOB_RAW}")"
 echo "GPU array job : ${ARRAY_JOB} [afterok:${PREP_JOB}]"
 
-MERGE_JOB=$(sbatch --parsable \
+MERGE_JOB_RAW=$(sbatch --parsable \
     --job-name="utr5all_3merge" \
-    --output="${REPO_ROOT}/logs/utr5all_3_merge_%j.out" \
-    --error="${REPO_ROOT}/logs/utr5all_3_merge_%j.err" \
+    --output="${LOG_DIR}/utr5all_3_merge_%j.out" \
+    --error="${LOG_DIR}/utr5all_3_merge_%j.err" \
     --partition=ncpu \
     --cpus-per-task=2 \
     --mem=8G \
@@ -401,15 +505,51 @@ MERGE_JOB=$(sbatch --parsable \
     << EOF
 #!/bin/bash
 set -eo pipefail
+trap 'status=\$?; echo "[ERROR] \${SLURM_JOB_NAME:-merge} failed at line \${LINENO} with exit \${status}" >&2; exit \${status}' ERR
+echo "[INFO] Started \$(date -Is)"
+echo "[INFO] Host: \$(hostname)"
+echo "[INFO] PWD : \$(pwd)"
+echo "[INFO] Job : \${SLURM_JOB_ID:-unknown}"
 source \$(conda info --base)/etc/profile.d/conda.sh
 conda activate ribonn
 python all_utr5_mutagenesis/merge_summaries.py --outdir "${OUTDIR}"
+echo "[INFO] Finished \$(date -Is)"
 EOF
 )
+MERGE_JOB="$(slurm_job_id "${MERGE_JOB_RAW}")"
 echo "Merge job     : ${MERGE_JOB} [afterok:${ARRAY_JOB}]"
+
+cat >> "${SUBMISSION_MANIFEST}" << EOF
+prep_job	${PREP_JOB_RAW}
+prep_status_job	${PREP_STATUS_JOB_RAW}
+array_job	${ARRAY_JOB_RAW}
+merge_job	${MERGE_JOB_RAW}
+prepare_stdout	${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.out
+prepare_stderr	${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.err
+prepare_status_report	${OUTDIR}/slurm_prepare_status_${PREP_JOB}.txt
+array_stdout_glob	${LOG_DIR}/utr5all_2_predict_${ARRAY_JOB}_*.out
+array_stderr_glob	${LOG_DIR}/utr5all_2_predict_${ARRAY_JOB}_*.err
+merge_stdout	${LOG_DIR}/utr5all_3_merge_${MERGE_JOB}.out
+merge_stderr	${LOG_DIR}/utr5all_3_merge_${MERGE_JOB}.err
+EOF
+
+cat > "${DEBUG_COMMANDS}" << EOF
+squeue -j ${PREP_JOB},${PREP_STATUS_JOB},${ARRAY_JOB},${MERGE_JOB}
+sacct -j ${PREP_JOB},${PREP_STATUS_JOB},${ARRAY_JOB},${MERGE_JOB} --format=JobID,JobName%24,State,ExitCode,Elapsed,Reason%40
+tail -n 200 ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.out
+tail -n 200 ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.err
+cat ${OUTDIR}/slurm_prepare_status_${PREP_JOB}.txt
+EOF
 echo
 echo "Monitor:"
-echo "  squeue -j ${PREP_JOB},${ARRAY_JOB},${MERGE_JOB}"
+echo "  squeue -j ${PREP_JOB},${PREP_STATUS_JOB},${ARRAY_JOB},${MERGE_JOB}"
+echo "  sacct  -j ${PREP_JOB},${PREP_STATUS_JOB},${ARRAY_JOB},${MERGE_JOB} --format=JobID,JobName%24,State,ExitCode,Elapsed,Reason%40"
+echo "Logs/debug:"
+echo "  ${SUBMISSION_MANIFEST}"
+echo "  ${DEBUG_COMMANDS}"
+echo "  ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.out"
+echo "  ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.err"
+echo "  ${OUTDIR}/slurm_prepare_status_${PREP_JOB}.txt"
 echo "Final table:"
 echo "  ${OUTDIR}/final/all_utr5_position_scores.tsv.gz"
 if [[ "${ALL_UTR5}" -eq 0 ]]; then
