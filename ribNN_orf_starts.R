@@ -53,8 +53,7 @@ codon_pos_labels <- c("1 (A)", "2 (T/U)", "3 (G)")
 
 # Paste a run output folder here if you want the script to ignore the defaults.
 # Use the run folder that contains summaries/, not final/ and not a .tsv.gz file.
-INPUT_RESULTS_DIR <- "/nemo/lab/ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/mouse_whole_atg_deletions_mean_predicted_TE"
-INPUT_RESULTS_DIR <- ""
+INPUT_RESULTS_DIR <- "/Volumes/lab-ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/mouse_whole_atg_deletions_mean_predicted_TE"
 # Example:
 # INPUT_RESULTS_DIR <- "/nemo/lab/ulej/home/shared/oscar_ira_riboloco/RiboNN_ISM/all_utr5_mutagenesis/output/mouse_whole_atg_deletions_mean_predicted_TE"
 
@@ -123,6 +122,13 @@ ism_results.dir <- Sys.getenv(
 if (nzchar(input_results_dir)) {
   ism_results.dir <- input_results_dir
 }
+results_source <- if (nzchar(input_results_dir)) {
+  "INPUT_RESULTS_DIR"
+} else if (nzchar(Sys.getenv("RIBONN_ORF_RESULTS_DIR"))) {
+  "RIBONN_ORF_RESULTS_DIR"
+} else {
+  "default"
+}
 ism_summary.dir <- if (dir.exists(file.path(ism_results.dir, "summaries"))) {
   file.path(ism_results.dir, "summaries")
 } else {
@@ -146,6 +152,7 @@ master_table <- if (nzchar(input_master_table)) {
 }
 
 cat("Species:", species, "\n")
+cat("Results source:", results_source, "\n")
 cat("ISM summaries:", ism_summary.dir, "\n")
 cat("Master table:", master_table, "\n")
 
@@ -333,6 +340,80 @@ ism_whole.df <- ism.df %>%
   add_dist_bin("orf_start_offset") %>%
   filter(is.finite(whole_atg_delta))
 
+format_mw_p <- function(p) {
+  ifelse(is.na(p), "NA", format.pval(p, digits = 2, eps = 1e-3))
+}
+
+safe_median <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+  median(x, na.rm = TRUE)
+}
+
+whole_atg_mw_one_bin <- function(df) {
+  det_values <- df$whole_atg_delta[df$detected_group == "Detected"]
+  undet_values <- df$whole_atg_delta[df$detected_group == "Not detected"]
+  n_detected <- length(det_values)
+  n_undetected <- length(undet_values)
+  median_detected <- safe_median(det_values)
+  median_undetected <- safe_median(undet_values)
+
+  base_row <- tibble(
+    status = "ok",
+    message = NA_character_,
+    test = "Mann-Whitney/Wilcoxon rank-sum",
+    n_detected = n_detected,
+    n_undetected = n_undetected,
+    median_detected = median_detected,
+    median_undetected = median_undetected,
+    median_difference = median_detected - median_undetected,
+    wilcox_p = NA_real_
+  )
+
+  if (n_detected < 3 || n_undetected < 3) {
+    return(base_row %>%
+      mutate(
+        status = "skipped",
+        message = "Need at least 3 detected and 3 undetected ORFs."
+      ))
+  }
+
+  wt <- tryCatch(
+    wilcox.test(
+      whole_atg_delta ~ detected_group,
+      data = df,
+      exact = FALSE,
+      alternative = "two.sided"
+    ),
+    error = function(err) err
+  )
+  if (inherits(wt, "error")) {
+    return(base_row %>%
+      mutate(status = "error", message = conditionMessage(wt)))
+  }
+
+  base_row %>%
+    mutate(wilcox_p = wt$p.value)
+}
+
+whole_atg_bin_mw_stats.df <- ism_whole.df %>%
+  filter(!is.na(distance_bin)) %>%
+  group_by(facet_group, distance_bin) %>%
+  group_modify(~whole_atg_mw_one_bin(.x)) %>%
+  ungroup() %>%
+  mutate(
+    p_adjust_method = "BH across tested whole-ATG distance bins",
+    n_tests_bh = sum(!is.na(wilcox_p)),
+    wilcox_p_adj_bh = p.adjust(wilcox_p, method = "BH"),
+    mw_label = paste0("MW FDR=", format_mw_p(wilcox_p_adj_bh))
+  )
+
+print(whole_atg_bin_mw_stats.df)
+
+whole_atg_bin_mw_labels.df <- whole_atg_bin_mw_stats.df %>%
+  filter(status == "ok")
+
 whole_atg_deletion_box.gg <- ism_whole.df %>%
   ggplot(aes(x = detected_group, y = whole_atg_delta,
              fill = orf_definition_sub, colour = orf_definition_sub)) +
@@ -363,6 +444,14 @@ whole_atg_deletion_dist_bins.gg <- ism_whole.df %>%
     geom = "text",
     vjust = 1.5, size = 2.0, colour = "grey30", show.legend = FALSE
   ) +
+  geom_text(
+    data = whole_atg_bin_mw_labels.df,
+    aes(x = 1.5, y = Inf, label = mw_label),
+    inherit.aes = FALSE,
+    vjust = 3.3,
+    size = 2.0,
+    colour = "grey25"
+  ) +
   facet_grid(facet_group ~ distance_bin) +
   scale_fill_manual(values = PUB_SUB_COLORS, name = "ORF class") +
   scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class") +
@@ -371,27 +460,69 @@ whole_atg_deletion_dist_bins.gg <- ism_whole.df %>%
   theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
         legend.position = "top")
 
-smooth_regression_input.df <- ism_whole.df %>%
-  mutate(
-    delta_te = whole_atg_delta,
-    detected_status = if_else(detected_group == "Detected", 1, 0),
-    gene_re = factor(gene_id),
-    orf_length_nt = as.numeric(orf_length_nt),
-    orf_start_offset = as.numeric(orf_start_offset)
-  ) %>%
-  filter(
-    is.finite(delta_te),
-    is.finite(orf_start_offset),
-    is.finite(orf_length_nt),
-    !is.na(gene_re),
-    !is.na(facet_group)
-  )
+make_whole_atg_distance_plot <- function(structural_type) {
+  structural_levels <- PUB_SUB_LEVELS[
+    FACET_GROUP[PUB_SUB_LEVELS] == structural_type
+  ]
+  structural_colors <- PUB_SUB_COLORS[structural_levels]
+  plot_df <- ism_whole.df %>%
+    filter(facet_group == structural_type, !is.na(distance_bin)) %>%
+    mutate(orf_definition_sub = fct_drop(orf_definition_sub))
+  stat_df <- whole_atg_bin_mw_labels.df %>%
+    filter(facet_group == structural_type)
 
+  ggplot(plot_df, aes(x = detected_group, y = whole_atg_delta,
+                      fill = orf_definition_sub, colour = orf_definition_sub)) +
+    geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+               linewidth = 0.35) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5,
+                 colour = "grey30", linewidth = 0.35) +
+    geom_jitter(width = 0.12, alpha = 0.35, size = 0.55, stroke = 0,
+                show.legend = FALSE) +
+    stat_summary(
+      fun.data = function(x) data.frame(y = Inf, label = paste0("n=", length(x))),
+      geom = "text",
+      vjust = 1.5, size = 2.0, colour = "grey30", show.legend = FALSE
+    ) +
+    geom_text(
+      data = stat_df,
+      aes(x = 1.5, y = Inf, label = mw_label),
+      inherit.aes = FALSE,
+      vjust = 3.3,
+      size = 2.0,
+      colour = "grey25"
+    ) +
+    facet_wrap(~distance_bin, nrow = 1) +
+    scale_fill_manual(values = structural_colors, name = structural_type) +
+    scale_colour_manual(values = structural_colors, name = structural_type) +
+    labs(x = NULL, y = "ΔTE (whole ATG deletion)",
+         title = structural_type) +
+    pub_box_theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          legend.position = "top")
+}
 
+pub_dist_bins_uorf.gg <- make_whole_atg_distance_plot("uORF")
+pub_dist_bins_uo_orf.gg <- make_whole_atg_distance_plot("uoORF")
+pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
+                                       pub_dist_bins_uo_orf.gg,
+                                       ncol = 2, align = "hv")
+
+cat("Whole-ATG deletion mode: skipping reference-base mutation heatmaps.\n")
+hm_a.gg <- NULL
+box_a.gg <- NULL
+pub_orf_class.gg <- NULL
+pub_hm_sub.gg <- NULL
+pub_hm_del.gg <- NULL
+heatmap.gg <- NULL
+pub_line.gg <- NULL
+within_aug_staircase.gg <- NULL
+within_aug_contrast.gg <- NULL
+within_aug_interaction_coef.gg <- NULL
 
 pub_whole_atg_deletion.gg <- cowplot::plot_grid(
   whole_atg_deletion_box.gg,
-  whole_atg_deletion_dist_bins.gg,
+  pub_dist_bins.gg,
   ncol = 1,
   rel_heights = c(1.0, 1.2),
   align = "v",
@@ -497,48 +628,6 @@ codon_heatmap_theme <- list(
   )
 )
 
-codon_sub.gg <- summarise_by_codon_pos(pos.df, "substitution_te_change_mean") %>%
-  ggplot(aes(x = pos_label, y = orf_definition, fill = mean_change)) +
-  geom_tile(colour = "white", linewidth = 0.8) +
-  geom_text(aes(label = sprintf("%.4f", mean_change)), size = 3) +
-  labs(x = "ATG codon position", y = NULL,
-       title = "Mean substitution ΔTE per codon position and ORF class") +
-  codon_heatmap_theme
-
-codon_del.gg <- summarise_by_codon_pos(pos.df, "deletion_te_change") %>%
-  ggplot(aes(x = pos_label, y = orf_definition, fill = mean_change)) +
-  geom_tile(colour = "white", linewidth = 0.8) +
-  geom_text(aes(label = sprintf("%.4f", mean_change)), size = 3) +
-  labs(x = "ATG codon position", y = NULL,
-       title = "Mean deletion ΔTE per codon position and ORF class") +
-  codon_heatmap_theme
-
-
-# ============================================================
-# Codon-position violin: per-position distribution per group
-# ============================================================
-
-codon_pos_violin_sub.gg <- ggplot(pos.df,
-                                  aes(x = pos_label, y = substitution_te_change_mean, fill = orf_definition)) +
-  geom_violin(scale = "width", linewidth = 0.3) +
-  geom_boxplot(fill = "white", alpha = 0.5, width = 0.08, outlier.shape = NA) +
-  scale_fill_manual(values = orf_definition_colors) +
-  facet_wrap(~orf_definition, ncol = 2) +
-  labs(x = "ATG codon position", y = "Substitution ΔTE",
-       title = "Substitution TE change per codon position") +
-  theme_classic() +
-  guides(fill = "none")
-
-codon_pos_violin_del.gg <- ggplot(pos.df,
-                                  aes(x = pos_label, y = deletion_te_change, fill = orf_definition)) +
-  geom_violin(scale = "width", linewidth = 0.3) +
-  geom_boxplot(fill = "white", alpha = 0.5, width = 0.08, outlier.shape = NA) +
-  scale_fill_manual(values = orf_definition_colors) +
-  facet_wrap(~orf_definition, ncol = 2) +
-  labs(x = "ATG codon position", y = "Deletion ΔTE",
-       title = "Deletion TE change per codon position") +
-  theme_classic() +
-  guides(fill = "none")
 
 
 # ============================================================
@@ -597,25 +686,6 @@ meta_dist_theme <- list(
   )
 )
 
-meta_dist_sub.gg <- ggplot(meta_dist_sub,
-                           aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
-  geom_tile() +
-  labs(
-    x     = "Distance of ORF start from CDS (nt, negative = upstream)",
-    y     = NULL,
-    title = "Mean substitution ΔTE vs ORF start distance from CDS"
-  ) +
-  meta_dist_theme
-
-meta_dist_del.gg <- ggplot(meta_dist_del,
-                           aes(x = dist_bin, y = fct_rev(orf_definition), fill = mean_change)) +
-  geom_tile() +
-  labs(
-    x     = "Distance of ORF start from CDS (nt, negative = upstream)",
-    y     = NULL,
-    title = "Mean deletion ΔTE vs ORF start distance from CDS"
-  ) +
-  meta_dist_theme
 
 
 # ============================================================
@@ -1161,4 +1231,4 @@ pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
                                        pub_dist_bins_uo_orf.gg,
                                        ncol = 2, align = "hv")
 
-
+}
