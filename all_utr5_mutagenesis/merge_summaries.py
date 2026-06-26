@@ -66,11 +66,16 @@ def main():
     manifest_path = outdir / "workflow_manifest.json"
     manifest = read_json(manifest_path)
     expected_shards = int(manifest["effective_shards"])
+    screen_mode = manifest.get("screen_mode", "all_utr5")
     summary_dir = outdir / "summaries"
     final_dir = outdir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    output_path = final_dir / "all_utr5_position_scores.tsv.gz"
-    orf_output_path = final_dir / "orf_start_codon_scores.tsv.gz"
+    if screen_mode == "whole_atg_deletion":
+        output_path = final_dir / "whole_atg_deletion_scores.tsv.gz"
+        orf_output_path = final_dir / "whole_atg_deletion_orf_scores.tsv.gz"
+    else:
+        output_path = final_dir / "all_utr5_position_scores.tsv.gz"
+        orf_output_path = final_dir / "orf_start_codon_scores.tsv.gz"
 
     row_count, transcript_ids = merge_ordered_shards(
         summary_dir,

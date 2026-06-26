@@ -362,9 +362,11 @@ def load_orf_predictions(path: str | Path) -> dict[str, list[dict]]:
 
 
 def apply_orf_start_targets(
-    records: list[dict], orf_predictions_path: str | Path
+    records: list[dict],
+    orf_predictions_path: str | Path,
+    whole_atg_deletion: bool = False,
 ) -> tuple[list[dict], list[dict], dict[str, tuple[str, str]], int]:
-    """Restrict the screen to ATG start-codon bases fully inside the 5'UTR."""
+    """Restrict the screen to ATG start codons fully inside the 5'UTR."""
     predictions_by_tx = load_orf_predictions(orf_predictions_path)
     filtered_records: list[dict] = []
     orf_audit_rows: list[dict] = []
@@ -448,15 +450,29 @@ def apply_orf_start_targets(
 
         targets = [target_by_start[start] for start in sorted(target_by_start)]
         positions = sorted(target_positions)
+        if whole_atg_deletion:
+            screen_mode = "whole_atg_deletion"
+            target_positions_encoded = ";".join(
+                str(target["orf_start_1based"]) for target in targets
+            )
+            target_position_count = len(targets)
+            variant_count = 1 + len(targets)
+            status_reason = "whole_atg_deletion_screen"
+        else:
+            screen_mode = "orf_start_codon"
+            target_positions_encoded = ";".join(str(pos) for pos in positions)
+            target_position_count = len(positions)
+            variant_count = 1 + 4 * len(positions)
+            status_reason = "orf_start_codon_screen"
         record = dict(record)
-        record["screen_mode"] = "orf_start_codon"
-        record["target_position_count"] = len(positions)
-        record["target_positions_1based"] = ";".join(str(pos) for pos in positions)
+        record["screen_mode"] = screen_mode
+        record["target_position_count"] = target_position_count
+        record["target_positions_1based"] = target_positions_encoded
         record["orf_target_count"] = len(targets)
         record["orf_targets_json"] = json.dumps(targets, separators=(",", ":"))
-        record["variant_count"] = 1 + 4 * len(positions)
+        record["variant_count"] = variant_count
         filtered_records.append(record)
-        transcript_status[transcript_id] = ("included", "orf_start_codon_screen")
+        transcript_status[transcript_id] = ("included", status_reason)
 
     return filtered_records, orf_audit_rows, transcript_status, non_atg_count
 
@@ -540,6 +556,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--whole-atg-deletion",
+        action="store_true",
+        help=(
+            "With --orf-predictions, predict only one full 3-base ATG deletion "
+            "per retained ORF start instead of per-base substitutions/deletions."
+        ),
+    )
+    parser.add_argument(
         "--no-truncate-utr3",
         dest="truncate_utr3",
         action="store_false",
@@ -559,6 +583,8 @@ def main():
     args = parse_args()
     if args.num_shards <= 0:
         raise ValueError("--num-shards must be positive")
+    if args.whole_atg_deletion and not args.orf_predictions:
+        raise ValueError("--whole-atg-deletion requires --orf-predictions")
 
     defaults = DEFAULT_REFS[args.species]
     args.gtf = args.gtf or str(defaults["gtf"])
@@ -610,9 +636,13 @@ def main():
         if not Path(args.orf_predictions).is_file():
             raise FileNotFoundError(f"ORF prediction CSV not found: {args.orf_predictions}")
         records, orf_audit_rows, transcript_target_status, non_atg_orf_starts = (
-            apply_orf_start_targets(records, args.orf_predictions)
+            apply_orf_start_targets(
+                records,
+                args.orf_predictions,
+                whole_atg_deletion=args.whole_atg_deletion,
+            )
         )
-        screen_mode = "orf_start_codon"
+        screen_mode = "whole_atg_deletion" if args.whole_atg_deletion else "orf_start_codon"
         for audit in audit_rows:
             if audit.get("status") != "included":
                 continue
@@ -694,6 +724,7 @@ def main():
         "source": source,
         "screen_mode": screen_mode,
         "orf_predictions": str(args.orf_predictions) if args.orf_predictions else None,
+        "whole_atg_deletion": args.whole_atg_deletion,
         "truncate_utr3": args.truncate_utr3,
         "requested_shards": args.num_shards,
         "effective_shards": len(shards),

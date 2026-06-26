@@ -256,7 +256,7 @@ def parse_variant_id(value: str) -> dict:
     if parsed["kind"] == "sub" and len(parts) == 5:
         parsed.update(position_1based=int(parts[2]), ref=parts[3], alt=parts[4])
         return parsed
-    if parsed["kind"] == "del" and len(parts) == 4:
+    if parsed["kind"] in {"del", "del3"} and len(parts) == 4:
         parsed.update(position_1based=int(parts[2]), ref=parts[3])
         return parsed
     raise ValueError(f"Invalid variant ID: {value}")

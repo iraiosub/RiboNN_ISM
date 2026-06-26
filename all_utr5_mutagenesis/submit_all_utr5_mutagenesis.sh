@@ -70,6 +70,8 @@ Input options:
   --orf-predictions PATH    ORF prediction/master table; defaults are
                             species-specific
   --all-utr5                Mutate every retained 5'UTR base instead of ORF starts
+  --whole-atg-deletion      Delete each retained 5'UTR ATG start codon as one
+                            3-base event instead of per-base mutagenesis
   --transcript-fasta PATH   Full transcript FASTA; requires --gtf
   --genome-fasta PATH       Reconstruct transcripts from genome FASTA + GTF
   --gtf PATH
@@ -108,6 +110,7 @@ GENOME_FASTA=""
 GTF=""
 ORF_PREDICTIONS=""
 ALL_UTR5=0
+WHOLE_ATG_DELETION=0
 INPUT_TABLE=""
 OUTDIR=""
 NUM_SHARDS=128
@@ -133,6 +136,7 @@ while [[ $# -gt 0 ]]; do
         --species) SPECIES="$2"; shift 2 ;;
         --orf-predictions) ORF_PREDICTIONS="$2"; shift 2 ;;
         --all-utr5) ALL_UTR5=1; shift ;;
+        --whole-atg-deletion) WHOLE_ATG_DELETION=1; shift ;;
         --transcript-fasta) TRANSCRIPT_FASTA="$2"; shift 2 ;;
         --genome-fasta|--fasta) GENOME_FASTA="$2"; shift 2 ;;
         --gtf) GTF="$2"; shift 2 ;;
@@ -207,6 +211,10 @@ if [[ "${ALL_UTR5}" -eq 1 && -n "${ORF_PREDICTIONS}" ]]; then
     echo "[ERROR] --all-utr5 cannot be combined with --orf-predictions." >&2
     exit 2
 fi
+if [[ "${ALL_UTR5}" -eq 1 && "${WHOLE_ATG_DELETION}" -eq 1 ]]; then
+    echo "[ERROR] --whole-atg-deletion cannot be combined with --all-utr5." >&2
+    exit 2
+fi
 
 GTF="${GTF:-${DEFAULT_GTF}}"
 GENOME_FASTA="${GENOME_FASTA:-${DEFAULT_GENOME}}"
@@ -222,6 +230,10 @@ else
 fi
 RUN_LABEL="orf_start_codon"
 DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_orf_starts_${TE_LABEL}"
+if [[ "${WHOLE_ATG_DELETION}" -eq 1 ]]; then
+    RUN_LABEL="whole_atg_deletion"
+    DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_whole_atg_deletions_${TE_LABEL}"
+fi
 if [[ "${ALL_UTR5}" -eq 1 ]]; then
     RUN_LABEL="all_utr5"
     DEFAULT_OUTDIR="${REPO_ROOT}/all_utr5_mutagenesis/output/${SPECIES}_all_utr5_${TE_LABEL}"
@@ -250,6 +262,10 @@ fi
 SCREEN_LABEL="ORF start codons in 5'UTR: ${ORF_PREDICTIONS}"
 if [[ "${ALL_UTR5}" -eq 0 ]]; then
     PREP_SOURCE_ARGS+=(--orf-predictions "${ORF_PREDICTIONS}")
+    if [[ "${WHOLE_ATG_DELETION}" -eq 1 ]]; then
+        PREP_SOURCE_ARGS+=(--whole-atg-deletion)
+        SCREEN_LABEL="whole 5'UTR ATG deletions: ${ORF_PREDICTIONS}"
+    fi
 else
     SCREEN_LABEL="all retained 5'UTR bases"
 fi
@@ -294,6 +310,7 @@ source	${SOURCE_LABEL}
 gtf	${GTF}
 screen	${SCREEN_LABEL}
 run_label	${RUN_LABEL}
+whole_atg_deletion	${WHOLE_ATG_DELETION}
 outdir	${OUTDIR}
 num_shards	${NUM_SHARDS}
 max_concurrent	${MAX_CONCURRENT}
@@ -551,7 +568,12 @@ echo "  ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.out"
 echo "  ${LOG_DIR}/utr5all_1_prepare_${PREP_JOB}.err"
 echo "  ${OUTDIR}/slurm_prepare_status_${PREP_JOB}.txt"
 echo "Final table:"
-echo "  ${OUTDIR}/final/all_utr5_position_scores.tsv.gz"
-if [[ "${ALL_UTR5}" -eq 0 ]]; then
+if [[ "${WHOLE_ATG_DELETION}" -eq 1 ]]; then
+    echo "  ${OUTDIR}/final/whole_atg_deletion_scores.tsv.gz"
+    echo "  ${OUTDIR}/final/whole_atg_deletion_orf_scores.tsv.gz"
+elif [[ "${ALL_UTR5}" -eq 0 ]]; then
+    echo "  ${OUTDIR}/final/all_utr5_position_scores.tsv.gz"
     echo "  ${OUTDIR}/final/orf_start_codon_scores.tsv.gz"
+else
+    echo "  ${OUTDIR}/final/all_utr5_position_scores.tsv.gz"
 fi

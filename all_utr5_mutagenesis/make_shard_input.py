@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 from workflow_common import BASES, open_text, variant_id
@@ -33,6 +34,16 @@ def target_positions(row: dict, utr5_size: int) -> list[int]:
     return positions
 
 
+def load_orf_targets(row: dict) -> list[dict]:
+    raw = str(row.get("orf_targets_json", "") or "").strip()
+    if not raw:
+        return []
+    targets = json.loads(raw)
+    if not isinstance(targets, list):
+        raise ValueError("orf_targets_json must encode a list")
+    return targets
+
+
 def main():
     args = parse_args()
     output = Path(args.output)
@@ -53,13 +64,35 @@ def main():
             sequence = row["tx_sequence"]
             utr5_size = int(row["utr5_size"])
             cds_size = int(row["cds_size"])
-            positions = target_positions(row, utr5_size)
+            screen_mode = str(row.get("screen_mode", "all_utr5") or "all_utr5")
 
             writer.writerow(
                 [variant_id(tx_index, "wt"), sequence, utr5_size, cds_size]
             )
             variant_count += 1
 
+            if screen_mode == "whole_atg_deletion":
+                for target in load_orf_targets(row):
+                    start = int(target["orf_start_1based"])
+                    ref = sequence[start - 1 : start + 2]
+                    if ref != "ATG":
+                        raise ValueError(
+                            f"tx_index={tx_index}, orf_start={start}: "
+                            f"expected ATG, found {ref}"
+                        )
+                    deleted = sequence[: start - 1] + sequence[start + 2 :]
+                    writer.writerow(
+                        [
+                            variant_id(tx_index, "del3", start, ref),
+                            deleted,
+                            utr5_size - 3,
+                            cds_size,
+                        ]
+                    )
+                    variant_count += 1
+                continue
+
+            positions = target_positions(row, utr5_size)
             for pos1 in positions:
                 pos0 = pos1 - 1
                 ref = sequence[pos0]
