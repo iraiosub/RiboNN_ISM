@@ -258,6 +258,61 @@ if (whole_atg_mode) {
 suppressPackageStartupMessages(library(cowplot))
 
 SHOW_LOW_EXPR <- FALSE
+WHOLE_ATG_BOOTSTRAP_REPS <- as.integer(Sys.getenv(
+  "RIBONN_WHOLE_ATG_BOOTSTRAP_REPS",
+  "0"
+))
+WHOLE_ATG_BOOTSTRAP_SEED <- as.integer(Sys.getenv(
+  "RIBONN_WHOLE_ATG_BOOTSTRAP_SEED",
+  "1"
+))
+if (is.na(WHOLE_ATG_BOOTSTRAP_REPS) || WHOLE_ATG_BOOTSTRAP_REPS < 0) {
+  stop("RIBONN_WHOLE_ATG_BOOTSTRAP_REPS must be an integer >= 0.")
+}
+if (is.na(WHOLE_ATG_BOOTSTRAP_SEED)) {
+  stop("RIBONN_WHOLE_ATG_BOOTSTRAP_SEED must be an integer.")
+}
+set.seed(WHOLE_ATG_BOOTSTRAP_SEED)
+cat("Whole-ATG HL bootstrap reps:", WHOLE_ATG_BOOTSTRAP_REPS, "\n")
+
+find_phylop_col <- function(df) {
+  exact_match <- names(df)[tolower(names(df)) == "phylop"]
+  if (length(exact_match) > 0) {
+    return(exact_match[[1]])
+  }
+
+  loose_match <- names(df)[str_detect(tolower(names(df)), "phylop")]
+  if (length(loose_match) > 0) {
+    return(loose_match[[1]])
+  }
+
+  NA_character_
+}
+
+find_gene_label_col <- function(df) {
+  candidates <- c(
+    "gene_name",
+    "gene_symbol",
+    "symbol",
+    "external_gene_name",
+    "mgi_symbol",
+    "hgnc_symbol"
+  )
+  for (candidate in candidates) {
+    exact_match <- names(df)[tolower(names(df)) == tolower(candidate)]
+    if (length(exact_match) > 0) {
+      return(exact_match[[1]])
+    }
+  }
+
+  NA_character_
+}
+
+phylop_col <- find_phylop_col(master.df)
+if (is.na(phylop_col)) {
+  stop("Master table is missing a phyloP column needed for whole-ATG deletion scatter plots.")
+}
+cat("phyloP column:", phylop_col, "\n")
 
 PUB_SUB_LEVELS <- if (SHOW_LOW_EXPR) orf_definition_sub_levels else
   grep("low expr", orf_definition_sub_levels, value = TRUE, invert = TRUE)
@@ -323,8 +378,21 @@ orf_start_dist.df <- pos.df %>%
   ) %>%
   dplyr::select(orf_id, orf_start_offset = offset_from_cds_start, orf_length_nt)
 
+master_phylop.df <- master.df %>%
+  filter(!is.na(orf_definition)) %>%
+  mutate(phylop = suppressWarnings(as.numeric(.data[[phylop_col]]))) %>%
+  group_by(orf_id) %>%
+  summarise(
+    phylop = {
+      finite_phylop <- phylop[is.finite(phylop)]
+      if (length(finite_phylop) == 0) NA_real_ else mean(finite_phylop)
+    },
+    .groups = "drop"
+  )
+
 ism_whole.df <- ism.df %>%
   left_join(master_orf_def_sub.df, by = "orf_id") %>%
+  left_join(master_phylop.df, by = "orf_id") %>%
   filter(!is.na(orf_definition_sub)) %>%
   { if (!SHOW_LOW_EXPR) filter(., !grepl("low expr", orf_definition_sub)) else . } %>%
   mutate(
@@ -340,6 +408,425 @@ ism_whole.df <- ism.df %>%
   add_dist_bin("orf_start_offset") %>%
   filter(is.finite(whole_atg_delta))
 
+gene_label_col <- find_gene_label_col(ism_whole.df)
+if (!is.na(gene_label_col)) {
+  ism_whole.df <- ism_whole.df %>%
+    mutate(plot_gene_name = as.character(.data[[gene_label_col]]))
+  cat("Gene label column:", gene_label_col, "\n")
+} else {
+  master_gene_label_col <- find_gene_label_col(master.df)
+  if (!is.na(master_gene_label_col)) {
+    master_gene_labels.df <- master.df %>%
+      filter(!is.na(orf_definition)) %>%
+      transmute(
+        orf_id,
+        plot_gene_name = as.character(.data[[master_gene_label_col]])
+      ) %>%
+      distinct(orf_id, plot_gene_name)
+    ism_whole.df <- ism_whole.df %>%
+      left_join(master_gene_labels.df, by = "orf_id")
+    cat("Gene label column:", master_gene_label_col, "(master table)\n")
+  } else {
+    ism_whole.df <- ism_whole.df %>%
+      mutate(plot_gene_name = NA_character_)
+    warning("No gene-name column found; scatter labels will use generic top-ORF labels.")
+  }
+}
+
+WHOLE_ATG_PHYLOP_COR_METHOD <- "spearman"
+WHOLE_ATG_PHYLOP_COR_LABEL <- if_else(
+  WHOLE_ATG_PHYLOP_COR_METHOD == "pearson",
+  "Pearson r",
+  "Spearman rho"
+)
+
+format_corr_p <- function(p) {
+  ifelse(is.na(p), "NA", format.pval(p, digits = 2, eps = 1e-3))
+}
+
+whole_atg_phylop_cor_one_group <- function(df) {
+  complete_df <- df %>%
+    filter(is.finite(phylop), is.finite(whole_atg_delta))
+
+  n_complete <- nrow(complete_df)
+  base_row <- tibble(
+    method = WHOLE_ATG_PHYLOP_COR_METHOD,
+    n_complete = n_complete,
+    correlation = NA_real_,
+    p_value = NA_real_
+  )
+
+  if (
+    n_complete < 3 ||
+    n_distinct(complete_df$phylop) < 2 ||
+    n_distinct(complete_df$whole_atg_delta) < 2
+  ) {
+    return(base_row %>%
+      mutate(label = paste0(WHOLE_ATG_PHYLOP_COR_LABEL, "=NA\nn=", n_complete)))
+  }
+
+  cor_test <- tryCatch(
+    suppressWarnings(cor.test(
+      complete_df$phylop,
+      complete_df$whole_atg_delta,
+      method = WHOLE_ATG_PHYLOP_COR_METHOD,
+      exact = FALSE
+    )),
+    error = function(err) err
+  )
+
+  if (inherits(cor_test, "error")) {
+    return(base_row %>%
+      mutate(label = paste0(WHOLE_ATG_PHYLOP_COR_LABEL, "=NA\nn=", n_complete)))
+  }
+
+  base_row %>%
+    mutate(
+      correlation = unname(cor_test$estimate),
+      p_value = cor_test$p.value,
+      label = paste0(
+        WHOLE_ATG_PHYLOP_COR_LABEL, "=", sprintf("%.2f", correlation),
+        "\nP=", format_corr_p(p_value),
+        "\nn=", n_complete
+      )
+    )
+}
+
+whole_atg_phylop_cor_labels <- function(df, group_cols = character()) {
+  if (length(group_cols) == 0) {
+    return(whole_atg_phylop_cor_one_group(df))
+  }
+
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    group_modify(~whole_atg_phylop_cor_one_group(.x)) %>%
+    ungroup()
+}
+
+whole_atg_phylop.df <- ism_whole.df %>%
+  filter(
+    is.finite(phylop),
+    is.finite(whole_atg_delta),
+    as.character(orf_definition_sub) %in% PUB_SUB_LEVELS,
+    detected_group %in% c("Detected", "Not detected")
+  ) %>%
+  mutate(
+    orf_definition = fct_drop(orf_definition),
+    orf_definition_sub = fct_drop(orf_definition_sub),
+    detected_group = fct_drop(detected_group),
+    facet_group = fct_drop(facet_group)
+  )
+
+cat("Whole-ATG phyloP scatter complete rows:", nrow(whole_atg_phylop.df), "\n")
+
+whole_atg_phylop_plot.df <- whole_atg_phylop.df %>%
+  arrange(detected_group == "Detected")
+
+whole_atg_phylop_overall_corr.df <- whole_atg_phylop_cor_labels(whole_atg_phylop.df)
+whole_atg_phylop_orf_corr.df <- whole_atg_phylop_cor_labels(
+  whole_atg_phylop.df,
+  "orf_definition"
+)
+whole_atg_phylop_sub_corr.df <- whole_atg_phylop_cor_labels(
+  whole_atg_phylop.df,
+  c("facet_group", "detected_group")
+)
+whole_atg_phylop_distance_corr.df <- whole_atg_phylop_cor_labels(
+  whole_atg_phylop.df %>% filter(!is.na(distance_bin)),
+  "distance_bin"
+)
+whole_atg_phylop_distance_structure_corr.df <- whole_atg_phylop_cor_labels(
+  whole_atg_phylop.df %>% filter(!is.na(distance_bin), !is.na(facet_group)),
+  c("facet_group", "distance_bin")
+)
+
+whole_atg_phylop_corr_stats.df <- bind_rows(
+  whole_atg_phylop_overall_corr.df %>%
+    mutate(stratification = "pooled"),
+  whole_atg_phylop_distance_corr.df %>%
+    mutate(stratification = "distance_from_cds"),
+  whole_atg_phylop_distance_structure_corr.df %>%
+    mutate(stratification = "distance_from_cds_by_uORF_uoORF"),
+  whole_atg_phylop_orf_corr.df %>%
+    mutate(stratification = "orf_definition"),
+  whole_atg_phylop_sub_corr.df %>%
+    mutate(stratification = "orf_definition_by_uORF_uoORF")
+) %>%
+  relocate(stratification)
+
+print(whole_atg_phylop_corr_stats.df)
+
+phylop_scatter_theme <- pub_base_theme +
+  theme(
+    panel.grid.major = element_line(colour = "grey92", linewidth = 0.25),
+    legend.position = "right",
+    plot.margin = margin(5.5, 12, 5.5, 5.5)
+  )
+
+phylop_target_genes <- c("scn2a", "scn8a")
+
+label_orf_name <- function(df) {
+  case_when(
+    !is.na(df$plot_gene_name) & nzchar(df$plot_gene_name) ~ df$plot_gene_name,
+    TRUE ~ "max |ΔTE| ORF"
+  )
+}
+
+grouped_slice_max_abs_delta <- function(df, group_cols) {
+  if (length(group_cols) == 0) {
+    return(df %>%
+      slice_max(order_by = abs(whole_atg_delta), n = 1, with_ties = FALSE))
+  }
+
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    slice_max(order_by = abs(whole_atg_delta), n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+grouped_slice_max_delta <- function(df, group_cols) {
+  if (length(group_cols) == 0) {
+    return(df %>%
+      slice_max(order_by = whole_atg_delta, n = 1, with_ties = FALSE))
+  }
+
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    slice_max(order_by = whole_atg_delta, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+target_gene_phylop_labels <- function(df, group_cols = character()) {
+  target_df <- df %>%
+    filter(str_to_lower(plot_gene_name) %in% phylop_target_genes)
+
+  if (length(group_cols) == 0) {
+    target_df <- target_df %>%
+      group_by(plot_gene_name) %>%
+      slice_max(order_by = abs(whole_atg_delta), n = 1, with_ties = FALSE) %>%
+      ungroup()
+  } else {
+    target_df <- target_df %>%
+      group_by(across(all_of(c(group_cols, "plot_gene_name")))) %>%
+      slice_max(order_by = abs(whole_atg_delta), n = 1, with_ties = FALSE) %>%
+      ungroup()
+  }
+
+  target_df %>%
+    mutate(
+      plot_label = plot_gene_name,
+      label_priority = 1L
+    )
+}
+
+top_delta_phylop_labels <- function(df, group_cols = character()) {
+  grouped_slice_max_abs_delta(df, group_cols) %>%
+    mutate(
+      plot_label = paste0(label_orf_name(.), "\nmax |ΔTE|"),
+      label_priority = 2L
+    )
+}
+
+top_detected_delta_phylop_labels <- function(df, group_cols = character()) {
+  df %>%
+    filter(detected_group == "Detected") %>%
+    grouped_slice_max_delta(group_cols) %>%
+    mutate(
+      plot_label = paste0(label_orf_name(.), "\nhighest detected ΔTE"),
+      label_priority = 3L
+    )
+}
+
+phylop_label_df <- function(df, group_cols = character(), include_top = TRUE) {
+  label_df <- target_gene_phylop_labels(df, group_cols)
+  if (include_top) {
+    label_df <- bind_rows(
+      label_df,
+      top_delta_phylop_labels(df, group_cols),
+      top_detected_delta_phylop_labels(df, group_cols)
+    )
+  }
+
+  label_df %>%
+    arrange(label_priority) %>%
+    distinct(across(all_of(c(group_cols, "orf_id"))), .keep_all = TRUE)
+}
+
+phylop_label_layer <- function(label_df, size = 2.2) {
+  geom_label(
+    data = label_df,
+    aes(x = phylop, y = whole_atg_delta, label = plot_label),
+    inherit.aes = FALSE,
+    size = size,
+    label.size = 0.12,
+    label.padding = unit(0.08, "lines"),
+    fill = "white",
+    alpha = 0.75,
+    colour = "grey15",
+    show.legend = FALSE
+  )
+}
+
+whole_atg_phylop_overall_label.df <- phylop_label_df(whole_atg_phylop.df)
+whole_atg_phylop_orf_label.df <- phylop_label_df(
+  whole_atg_phylop.df,
+  "orf_definition"
+)
+whole_atg_phylop_distance_label.df <- phylop_label_df(
+  whole_atg_phylop.df %>% filter(!is.na(distance_bin)),
+  "distance_bin"
+)
+whole_atg_phylop_distance_structure_label.df <- phylop_label_df(
+  whole_atg_phylop.df %>% filter(!is.na(distance_bin), !is.na(facet_group)),
+  c("facet_group", "distance_bin")
+)
+whole_atg_phylop_sub_label.df <- phylop_label_df(
+  whole_atg_phylop.df,
+  c("facet_group", "detected_group")
+)
+
+whole_atg_phylop_scatter.gg <- ggplot(
+  whole_atg_phylop_plot.df,
+  aes(x = phylop, y = whole_atg_delta)
+) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_point(colour = "#3A6EA5", alpha = 0.35, size = 0.75, stroke = 0) +
+  phylop_label_layer(whole_atg_phylop_overall_label.df, size = 2.3) +
+  geom_text(
+    data = whole_atg_phylop_overall_corr.df,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 3.0,
+    colour = "grey20"
+  ) +
+  labs(
+    x = "phyloP",
+    y = "ΔTE (whole ATG deletion)",
+    title = "phyloP vs whole-ATG deletion ΔTE"
+  ) +
+  phylop_scatter_theme
+
+whole_atg_phylop_orf_type_scatter.gg <- ggplot(
+  whole_atg_phylop_plot.df,
+  aes(x = phylop, y = whole_atg_delta, colour = orf_definition)
+) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_point(alpha = 0.35, size = 0.65, stroke = 0) +
+  phylop_label_layer(whole_atg_phylop_orf_label.df, size = 2.2) +
+  geom_text(
+    data = whole_atg_phylop_orf_corr.df,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 2.6,
+    colour = "grey20"
+  ) +
+  facet_wrap(~orf_definition, ncol = 2) +
+  scale_colour_manual(values = orf_definition_colors, name = "ORF class") +
+  labs(
+    x = "phyloP",
+    y = "ΔTE (whole ATG deletion)",
+    title = "phyloP vs whole-ATG deletion ΔTE by ORF class"
+  ) +
+  phylop_scatter_theme +
+  guides(colour = "none")
+
+whole_atg_phylop_distance_scatter.gg <- whole_atg_phylop_plot.df %>%
+  filter(!is.na(distance_bin)) %>%
+  ggplot(aes(x = phylop, y = whole_atg_delta)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_point(colour = "#3A6EA5", alpha = 0.35, size = 0.6, stroke = 0) +
+  phylop_label_layer(whole_atg_phylop_distance_label.df, size = 2.1) +
+  geom_text(
+    data = whole_atg_phylop_distance_corr.df,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 2.4,
+    colour = "grey20"
+  ) +
+  facet_wrap(~distance_bin, nrow = 1) +
+  labs(
+    x = "phyloP",
+    y = "ΔTE (whole ATG deletion)",
+    title = "phyloP vs whole-ATG deletion ΔTE by ORF start distance from CDS"
+  ) +
+  phylop_scatter_theme
+
+distance_structure_colors <- PUB_SUB_COLORS
+distance_structure_colors[grepl("^Not det\\.", names(distance_structure_colors))] <- "#AFAFAF"
+
+whole_atg_phylop_distance_structure_scatter.gg <- whole_atg_phylop_plot.df %>%
+  filter(!is.na(distance_bin), !is.na(facet_group)) %>%
+  ggplot(aes(x = phylop, y = whole_atg_delta, colour = orf_definition_sub)) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_point(alpha = 0.45, size = 0.85, stroke = 0) +
+  phylop_label_layer(whole_atg_phylop_distance_structure_label.df, size = 1.9) +
+  geom_text(
+    data = whole_atg_phylop_distance_structure_corr.df,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 2.1,
+    colour = "grey20"
+  ) +
+  facet_grid(facet_group ~ distance_bin) +
+  scale_colour_manual(values = distance_structure_colors, name = "ORF class") +
+  labs(
+    x = "phyloP",
+    y = "ΔTE (whole ATG deletion)",
+    title = "phyloP vs whole-ATG deletion ΔTE by distance and uORF/uoORF structure"
+  ) +
+  phylop_scatter_theme +
+  theme(legend.position = "bottom")
+
+whole_atg_phylop_orf_type_structure_scatter.gg <- ggplot(
+  whole_atg_phylop_plot.df,
+  aes(x = phylop, y = whole_atg_delta, colour = orf_definition_sub)
+) +
+  geom_hline(yintercept = 0, colour = "grey55", linetype = "dashed",
+             linewidth = 0.35) +
+  geom_point(alpha = 0.35, size = 0.6, stroke = 0) +
+  phylop_label_layer(whole_atg_phylop_sub_label.df, size = 2.1) +
+  geom_text(
+    data = whole_atg_phylop_sub_corr.df,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 2.4,
+    colour = "grey20"
+  ) +
+  facet_grid(facet_group ~ detected_group) +
+  scale_colour_manual(values = PUB_SUB_COLORS, name = "ORF class") +
+  labs(
+    x = "phyloP",
+    y = "ΔTE (whole ATG deletion)",
+    title = "phyloP vs whole-ATG deletion ΔTE by ORF class and uORF/uoORF structure"
+  ) +
+  phylop_scatter_theme
+
+pub_whole_atg_phylop.gg <- cowplot::plot_grid(
+  whole_atg_phylop_scatter.gg,
+  whole_atg_phylop_distance_scatter.gg,
+  whole_atg_phylop_distance_structure_scatter.gg,
+  whole_atg_phylop_orf_type_scatter.gg,
+  whole_atg_phylop_orf_type_structure_scatter.gg,
+  ncol = 1,
+  rel_heights = c(1.0, 1.0, 1.25, 1.35, 1.45),
+  align = "v",
+  axis = "l"
+)
+
 format_mw_p <- function(p) {
   ifelse(is.na(p), "NA", format.pval(p, digits = 2, eps = 1e-3))
 }
@@ -349,6 +836,20 @@ safe_median <- function(x) {
     return(NA_real_)
   }
   median(x, na.rm = TRUE)
+}
+
+pairwise_detected_minus_undetected <- function(det_values, undet_values) {
+  as.numeric(outer(det_values, undet_values, "-"))
+}
+
+bootstrap_hl_ci <- function(det_values, undet_values, n_boot) {
+  boot_hl <- replicate(n_boot, {
+    det_boot <- sample(det_values, length(det_values), replace = TRUE)
+    undet_boot <- sample(undet_values, length(undet_values), replace = TRUE)
+    safe_median(pairwise_detected_minus_undetected(det_boot, undet_boot))
+  })
+  stats::quantile(boot_hl, probs = c(0.025, 0.975),
+                  na.rm = TRUE, names = FALSE)
 }
 
 whole_atg_mw_one_bin <- function(df) {
@@ -368,6 +869,11 @@ whole_atg_mw_one_bin <- function(df) {
     median_detected = median_detected,
     median_undetected = median_undetected,
     median_difference = median_detected - median_undetected,
+    hodges_lehmann_difference = NA_real_,
+    hodges_lehmann_ci_low = NA_real_,
+    hodges_lehmann_ci_high = NA_real_,
+    bootstrap_reps = WHOLE_ATG_BOOTSTRAP_REPS,
+    common_language_p_detected_gt_not_detected = NA_real_,
     wilcox_p = NA_real_
   )
 
@@ -393,8 +899,25 @@ whole_atg_mw_one_bin <- function(df) {
       mutate(status = "error", message = conditionMessage(wt)))
   }
 
+  if (WHOLE_ATG_BOOTSTRAP_REPS == 0) {
+    return(base_row %>%
+      mutate(
+        message = "Hodges-Lehmann/bootstrap skipped; set RIBONN_WHOLE_ATG_BOOTSTRAP_REPS > 0 to enable.",
+        wilcox_p = wt$p.value
+      ))
+  }
+
+  pairwise_diffs <- pairwise_detected_minus_undetected(det_values, undet_values)
+  hl_ci <- bootstrap_hl_ci(det_values, undet_values, WHOLE_ATG_BOOTSTRAP_REPS)
+
   base_row %>%
-    mutate(wilcox_p = wt$p.value)
+    mutate(
+      hodges_lehmann_difference = safe_median(pairwise_diffs),
+      hodges_lehmann_ci_low = hl_ci[[1]],
+      hodges_lehmann_ci_high = hl_ci[[2]],
+      common_language_p_detected_gt_not_detected = mean(pairwise_diffs > 0),
+      wilcox_p = wt$p.value
+    )
 }
 
 whole_atg_bin_mw_stats.df <- ism_whole.df %>%
@@ -630,28 +1153,28 @@ codon_heatmap_theme <- list(
 
 
 
-# ============================================================
-# Individual ORF meta-heatmap: one row per ORF, 3 codon positions
-# ============================================================
-
-orf_wide.df <- pos.df %>%
-  dplyr::select(orf_id, orf_definition, orf_position_in_start_codon,
-                substitution_te_change_mean, deletion_te_change) %>%
-  pivot_wider(
-    names_from  = orf_position_in_start_codon,
-    values_from = c(substitution_te_change_mean, deletion_te_change),
-    names_prefix = "pos"
-  ) %>%
-  filter(complete.cases(.)) %>%
-  arrange(orf_definition, substitution_te_change_mean_pos1) %>%
-  mutate(orf_rank = row_number())
-
-clamp_lim <- quantile(
-  abs(c(orf_wide.df$substitution_te_change_mean_pos1,
-        orf_wide.df$substitution_te_change_mean_pos2,
-        orf_wide.df$substitution_te_change_mean_pos3)),
-  0.99, na.rm = TRUE
-)
+# # ============================================================
+# # Individual ORF meta-heatmap: one row per ORF, 3 codon positions
+# # ============================================================
+#
+# orf_wide.df <- pos.df %>%
+#   dplyr::select(orf_id, orf_definition, orf_position_in_start_codon,
+#                 substitution_te_change_mean, deletion_te_change) %>%
+#   pivot_wider(
+#     names_from  = orf_position_in_start_codon,
+#     values_from = c(substitution_te_change_mean, deletion_te_change),
+#     names_prefix = "pos"
+#   ) %>%
+#   filter(complete.cases(.)) %>%
+#   arrange(orf_definition, substitution_te_change_mean_pos1) %>%
+#   mutate(orf_rank = row_number())
+#
+# clamp_lim <- quantile(
+#   abs(c(orf_wide.df$substitution_te_change_mean_pos1,
+#         orf_wide.df$substitution_te_change_mean_pos2,
+#         orf_wide.df$substitution_te_change_mean_pos3)),
+#   0.99, na.rm = TRUE
+# )
 
 
 # ============================================================
@@ -1230,5 +1753,65 @@ pub_dist_bins_uo_orf.gg <- make_distance_bin_plot(
 pub_dist_bins.gg <- cowplot::plot_grid(pub_dist_bins_uorf.gg,
                                        pub_dist_bins_uo_orf.gg,
                                        ncol = 2, align = "hv")
+
+}
+
+
+
+#################
+
+if (whole_atg_mode) {
+  whole_atg_plot_dir_env <- trimws(Sys.getenv("RIBONN_ORF_PLOT_DIR", ""))
+  whole_atg_plot.dir <- if (nzchar(whole_atg_plot_dir_env)) {
+    whole_atg_plot_dir_env
+  } else {
+    file.path(ism_results.dir, "plots")
+  }
+  dir.create(whole_atg_plot.dir, recursive = TRUE, showWarnings = FALSE)
+
+  fwrite(
+    whole_atg_phylop_corr_stats.df,
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_correlation_stats.tsv"),
+    sep = "\t"
+  )
+
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_scatter.png"),
+    whole_atg_phylop_scatter.gg,
+    width = 5.5, height = 4, dpi = 300
+  )
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_by_cds_distance.png"),
+    whole_atg_phylop_distance_scatter.gg,
+    width = 8, height = 3.5, dpi = 300
+  )
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_by_cds_distance_and_orf_type.png"),
+    whole_atg_phylop_distance_structure_scatter.gg,
+    width = 9, height = 5.5, dpi = 300
+  )
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_by_orf_type.png"),
+    whole_atg_phylop_orf_type_scatter.gg,
+    width = 7, height = 5.5, dpi = 300
+  )
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_by_orf_type_and_structure.png"),
+    whole_atg_phylop_orf_type_structure_scatter.gg,
+    width = 7, height = 5.5, dpi = 300
+  )
+  ggsave(
+    file.path(whole_atg_plot.dir, "whole_atg_phylop_all_panels.png"),
+    pub_whole_atg_phylop.gg,
+    width = 8, height = 17, dpi = 300
+  )
+
+  cat("Saved whole-ATG phyloP plots to:", whole_atg_plot.dir, "\n")
+
+  # print(whole_atg_phylop_scatter.gg)
+  print(whole_atg_phylop_distance_scatter.gg)
+  print(whole_atg_phylop_distance_structure_scatter.gg)
+  print(whole_atg_phylop_orf_type_scatter.gg)
+  print(whole_atg_phylop_orf_type_structure_scatter.gg)
 
 }
